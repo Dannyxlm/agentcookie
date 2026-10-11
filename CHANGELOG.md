@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Push sinks back off instead of failing in a loop
+
+- A push sink whose Tailscale peer is offline (a paused sandbox, a sleeping machine) is now skipped without being dialed. `source-state.json` marks it asleep and its failure count does not change.
+- A sink that keeps failing is retried on an exponential backoff, starting at 30 seconds and capped at 30 minutes. The backoff resets on the next successful push. Pushes inside the window skip that sink and still deliver to the others.
+- Sinks are pushed concurrently, each under its own timeout, so a dead sink no longer delays or starves the healthy ones.
+- Pushes started by the secrets-bus and discovery watchers share a 30-second rate cap, the same as the cookie watcher's, so a burst of file writes no longer starts a push per write.
+
 ### Keychain: --recreate keeps existing Chrome cookies readable
 
 - `agentcookie wizard set-keychain-access --recreate` deleted Chrome Safe Storage and re-added it with a random value, so every existing Chrome cookie on that Mac became unreadable. The same step also ran after `--any-app`'s guard refused to touch an unreadable item, which bypassed that guard. The step now recreates an existing item with its own value, refuses to delete an item whose value it cannot read, and uses a fresh value only when no item exists yet.

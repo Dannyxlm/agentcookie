@@ -48,6 +48,65 @@ var resolveSinkURL = tsclient.ResolveSinkURL
 // cookie-only, so they must not inherit process-home secrets bus state.
 var loadSecretsPayload = secretsbus.LoadPayloadWithDiscovery
 
+// sourceNow is the clock for per-sink backoff and push-trigger rate caps.
+// Tests replace it to step through the schedule without sleeping.
+var sourceNow = time.Now
+
+// pushTriggerMinInterval is the minimum gap between pushes started by the
+// secrets-bus and discovery watchers. It matches the cookie watcher's
+// default rate cap.
+const pushTriggerMinInterval = 30 * time.Second
+
+// rateCappedTrigger runs push at most once per minInterval. Calls inside the
+// window are dropped: the cookie watcher's baseline tick pushes the full
+// payload, secrets included, at the same interval, so a dropped trigger
+// is delivered by the next tick.
+type rateCappedTrigger struct {
+	minInterval time.Duration
+	push        func(context.Context)
+
+	mu   sync.Mutex
+	last time.Time
+}
+
+func newRateCappedTrigger(minInterval time.Duration, push func(context.Context)) *rateCappedTrigger {
+	return &rateCappedTrigger{minInterval: minInterval, push: push}
+}
+
+// fire runs push unless one started less than minInterval ago. It reports
+// whether push ran.
+func (t *rateCappedTrigger) fire(ctx context.Context) bool {
+	t.mu.Lock()
+	now := sourceNow()
+	if !t.last.IsZero() && now.Sub(t.last) < t.minInterval {
+		t.mu.Unlock()
+		return false
+	}
+	t.last = now
+	t.mu.Unlock()
+	t.push(ctx)
+	return true
+}
+
+// Per-sink push backoff: after N consecutive failures a sink is skipped for
+// sinkBackoffBase * 2^(N-1), capped at sinkBackoffMax. A success resets it.
+const (
+	sinkBackoffBase = 30 * time.Second
+	sinkBackoffMax  = 30 * time.Minute
+)
+
+// errSinkAsleep marks a sink whose Tailscale peer is offline. The source
+// skips it without dialing and records it as asleep, not as a failure.
+var errSinkAsleep = errors.New("sink peer is offline")
+
+func sinkBackoffDelay(consecutiveFailures int) time.Duration {
+	d := sinkBackoffBase
+	for i := 1; i < consecutiveFailures && d < sinkBackoffMax; i++ {
+		d *= 2
+	}
+	return min(d, sinkBackoffMax)
+}
+
 // SetResolveSinkURLForTesting replaces resolveSinkURL with the given
 // function and returns a restore func. Test-only seam.
 func SetResolveSinkURLForTesting(f func(ctx context.Context, rawURL string) (string, error)) func() {
@@ -164,14 +223,11 @@ func runSource(cmd *cobra.Command, args []string) error {
 		// payloads. The inner HTTP request also bounds itself; this
 		// outer cancel is the belt to the request's suspenders.
 		//
-		// Scale the outer budget by sink count: fan-out POSTs run
-		// sequentially, so a first sink that runs to its full per-sink
-		// timeout must not exhaust the shared deadline and starve later
-		// healthy sinks (which would defeat per-sink isolation). One
-		// per-sink ClientTimeout per sink, plus slack.
-		nSinks := max(len(sinks), 1)
+		// Fan-out POSTs run concurrently, each under its own per-sink
+		// ClientTimeout, so one per-sink timeout plus slack covers every
+		// sink: a dead sink cannot starve the healthy ones.
 		perSink := httpserver.Defaults(httpserver.SyncClient).ClientTimeout
-		ctx, cancel := context.WithTimeout(cmd.Context(), time.Duration(nSinks)*perSink+30*time.Second)
+		ctx, cancel := context.WithTimeout(cmd.Context(), perSink+30*time.Second)
 		defer cancel()
 		_, err := push(ctx)
 		return err
@@ -210,8 +266,13 @@ func runSource(cmd *cobra.Command, args []string) error {
 	// friend to create it) and fires the same push callback as the
 	// cookies watcher so the payload includes whichever surface changed.
 	watchHome, _ := os.UserHomeDir()
-	secretsWatcher := secretsbus.NewWatcher(watchHome, 0, func(ctx context.Context) {
+	// The secrets and discovery watchers share one rate cap so a burst of
+	// file writes cannot start a push per write.
+	trigger := newRateCappedTrigger(pushTriggerMinInterval, func(ctx context.Context) {
 		_, _ = push(ctx)
+	})
+	secretsWatcher := secretsbus.NewWatcher(watchHome, 0, func(ctx context.Context) {
+		trigger.fire(ctx)
 	})
 	go func() {
 		if err := secretsWatcher.Run(cmd.Context()); err != nil {
@@ -229,7 +290,7 @@ func runSource(cmd *cobra.Command, args []string) error {
 			if sourceVerbose && (len(delta.Added)+len(delta.Removed) > 0) {
 				fmt.Fprintf(os.Stderr, "agentcookie source --watch: discovery: added=%v removed=%v\n", delta.Added, delta.Removed)
 			}
-			_, _ = push(ctx)
+			trigger.fire(ctx)
 		},
 	)
 	go func() {
@@ -313,7 +374,7 @@ func pushWithFreshBlocklist(
 		recordSourcePushResult(srcState, stateWriter, nil, dbsc, err)
 		return 0, err
 	}
-	results, dbsc, err := pushOnce(ctx, cfg, blocklist, key, dryRun, verbose, skipDBSC, pullGen)
+	results, dbsc, err := pushOnce(ctx, cfg, blocklist, key, dryRun, verbose, skipDBSC, pullGen, srcState)
 	recordSourcePushResult(srcState, stateWriter, results, dbsc, err)
 	if err != nil {
 		return 0, err
@@ -359,7 +420,7 @@ func recordSourcePushResult(
 	if srcState == nil {
 		return
 	}
-	now := time.Now().UTC()
+	now := sourceNow().UTC()
 	// A read/envelope-phase failure (err != nil) is recorded once at the
 	// top level; no per-sink attempt happened.
 	if err != nil {
@@ -369,14 +430,26 @@ func recordSourcePushResult(
 	}
 	for _, r := range results {
 		ps := srcState.SinkFor(r.Peer, r.URL)
-		if r.Err != nil {
+		switch {
+		case !r.SkippedUntil.IsZero():
+			// Skipped inside its backoff window: no attempt, nothing to record.
+		case r.Asleep:
+			ps.Asleep = true
+			ps.LastAsleepAt = now
+		case r.Err != nil:
+			ps.Asleep = false
 			ps.TotalFailures++
+			ps.ConsecutiveFailures++
+			ps.BackoffUntil = now.Add(sinkBackoffDelay(ps.ConsecutiveFailures))
 			ps.LastError = r.Err.Error()
 			ps.LastErrorAt = now
 			srcState.TotalFailures++
 			srcState.LastError = r.Err.Error()
 			srcState.LastErrorAt = now
-		} else {
+		default:
+			ps.Asleep = false
+			ps.ConsecutiveFailures = 0
+			ps.BackoffUntil = time.Time{}
 			ps.TotalPushes++
 			ps.LastPushCount = r.Count
 			ps.LastPush = now
@@ -403,12 +476,16 @@ func recordSourcePushResult(
 	}
 }
 
-// sinkResult is one sink's outcome from a single fan-out push.
+// sinkResult is one sink's outcome from a single fan-out push. A sink that
+// was not dialed has Asleep (Tailscale reports its peer offline) or
+// SkippedUntil (inside its backoff window) set and a nil Err.
 type sinkResult struct {
-	Peer  string
-	URL   string
-	Count int // cookies posted to this sink (0 on error)
-	Err   error
+	Peer         string
+	URL          string
+	Count        int // cookies posted to this sink (0 on error)
+	Err          error
+	Asleep       bool
+	SkippedUntil time.Time
 }
 
 // sinkURLList renders sink URLs for a log line.
@@ -435,6 +512,7 @@ func pushOnce(
 	verbose bool,
 	skipDBSC bool,
 	pullGen uint64,
+	srcState *state.SourceState,
 ) ([]sinkResult, dbscSummary, error) {
 	var dbsc dbscSummary
 
@@ -598,39 +676,76 @@ func pushOnce(
 	pullPayloadCache.StoreIfCurrent(pullGen, payload)
 	// Fan out: read and filtering above happened once; only sealing and
 	// transport repeat per sink. Each sink is sealed with its own key and
-	// POSTed independently. A per-sink failure (missing key, seal error,
-	// URL-resolution, or POST) is isolated to that sink and recorded; the
-	// loop continues so the other sinks still receive the payload.
+	// POSTed concurrently under its own timeout, so a dead sink cannot hold
+	// up the others. A per-sink failure (missing key, seal error,
+	// URL-resolution, or POST) is isolated to that sink and recorded. A sink
+	// inside its backoff window is skipped without an attempt, and a sink
+	// whose peer Tailscale reports offline is skipped as asleep.
 	sinks := cfg.ResolvedSinks()
-	results := make([]sinkResult, 0, len(sinks))
+	now := sourceNow()
+	results := make([]sinkResult, len(sinks))
+	replies := make([]string, len(sinks))
+	var wg sync.WaitGroup
+	for i, sink := range sinks {
+		results[i] = sinkResult{Peer: sink.Peer, URL: sink.URL}
+		if srcState != nil {
+			if until := srcState.SinkFor(sink.Peer, sink.URL).BackoffUntil; now.Before(until) {
+				results[i].SkippedUntil = until
+				continue
+			}
+		}
+		wg.Add(1)
+		go func(r *sinkResult, reply *string, sink config.SinkTarget) {
+			defer wg.Done()
+			secret, secErr := resolveSinkSecret(common.ConfigDir, sink, cfg.Security.SharedSecret)
+			if secErr != nil {
+				r.Err = secErr
+				return
+			}
+			sealed, sealErr := transport.SealWithSecret(payload, secret)
+			if sealErr != nil {
+				r.Err = fmt.Errorf("seal payload: %w", sealErr)
+				return
+			}
+			body, postErr := postToSink(ctx, sink.URL, sealed, verbose)
+			switch {
+			case errors.Is(postErr, errSinkAsleep):
+				r.Asleep = true
+			case postErr != nil:
+				r.Err = postErr
+			default:
+				r.Count = len(all)
+				*reply = body
+			}
+		}(&results[i], &replies[i], sink)
+	}
+	wg.Wait()
+
 	sinkReports := make([]map[string]any, 0, len(sinks))
-	var humanLines []string
-	for _, sink := range sinks {
-		r := sinkResult{Peer: sink.Peer, URL: sink.URL}
-		secret, secErr := resolveSinkSecret(common.ConfigDir, sink, cfg.Security.SharedSecret)
-		if secErr != nil {
-			r.Err = secErr
-		} else if sealed, sealErr := transport.SealWithSecret(payload, secret); sealErr != nil {
-			r.Err = fmt.Errorf("seal payload: %w", sealErr)
-		} else if reply, postErr := postToSink(ctx, sink.URL, sealed, verbose); postErr != nil {
-			r.Err = postErr
-		} else {
-			r.Count = len(all)
-			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] posted %d cookies, sink replied: %s%s", sink.URL, len(all), reply, dbscNote(dbsc)))
-		}
-		if r.Err != nil {
-			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] push failed: %v", sink.URL, r.Err))
-		}
-		results = append(results, r)
-		rep := map[string]any{"url": sink.URL, "peer": sink.Peer, "posted": r.Err == nil}
-		if r.Err != nil {
+	humanLines := make([]string, 0, len(sinks))
+	delivered := 0
+	for i, r := range results {
+		rep := map[string]any{"url": r.URL, "peer": r.Peer, "posted": false}
+		switch {
+		case !r.SkippedUntil.IsZero():
+			rep["backoff_until"] = r.SkippedUntil.UTC().Format(time.RFC3339)
+			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] skipped: backing off after failures until %s", r.URL, r.SkippedUntil.Format(time.RFC3339)))
+		case r.Asleep:
+			rep["asleep"] = true
+			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] skipped: Tailscale reports the peer offline (asleep)", r.URL))
+		case r.Err != nil:
 			rep["error"] = r.Err.Error()
+			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] push failed: %v", r.URL, r.Err))
+		default:
+			delivered++
+			rep["posted"] = true
+			humanLines = append(humanLines, fmt.Sprintf("agentcookie source: [%s] posted %d cookies, sink replied: %s%s", r.URL, r.Count, replies[i], dbscNote(dbsc)))
 		}
 		sinkReports = append(sinkReports, rep)
 	}
 
 	result["sinks"] = sinkReports
-	result["posted"] = len(results) > 0 && len(aggregateFailedLabels(results)) == 0
+	result["posted"] = delivered > 0 && len(aggregateFailedLabels(results)) == 0
 	_ = emit(result, strings.Join(humanLines, "\n")+"\n")
 	return results, dbsc, nil
 }
@@ -673,12 +788,16 @@ func postToSink(ctx context.Context, rawURL string, sealed []byte, verbose bool)
 	// Resolve sink URL hostname to IP via Tailscale if needed, so a
 	// MagicDNS hostname (http://grok-bot:9999/sync) works instead of a
 	// frozen 100.x IP. Fail-closed errors (ErrAmbiguousPeer) abort this
-	// sink; soft failures fall back to the raw URL so HTTP reports the
-	// connection error.
+	// sink. A peer Tailscale reports offline is asleep: skip it without
+	// dialing. Other soft failures fall back to the raw URL so HTTP reports
+	// the connection error.
 	sinkURL := rawURL
 	if resolved, resolveErr := resolveSinkURL(ctx, sinkURL); resolveErr != nil {
 		if errors.Is(resolveErr, tsclient.ErrAmbiguousPeer) {
 			return "", fmt.Errorf("resolve sink URL: %w", resolveErr)
+		}
+		if errors.Is(resolveErr, tsclient.ErrPeerOffline) {
+			return "", fmt.Errorf("%w: %w", errSinkAsleep, resolveErr)
 		}
 		if verbose {
 			fmt.Fprintf(os.Stderr, "agentcookie source: sink URL resolution failed (%v); using original %s\n", resolveErr, sinkURL)

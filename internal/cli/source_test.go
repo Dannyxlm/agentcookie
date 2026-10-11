@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -404,6 +405,13 @@ type sourceCapture struct {
 	// failURL, when non-empty, makes a POST to that exact URL return a
 	// non-200 so tests can exercise per-sink failure isolation.
 	failURL string
+	// blockURL, when non-empty, makes a POST to that exact URL hang until
+	// the request context ends, standing in for a dead sink.
+	blockURL string
+	// attempts counts every POST per URL, including failed ones.
+	attempts map[string]int
+	// arrivals records when each URL's most recent POST reached the transport.
+	arrivals map[string]time.Time
 }
 
 func newSourceCapture(t *testing.T, secret string) *sourceCapture {
@@ -414,6 +422,18 @@ func newSourceCapture(t *testing.T, secret string) *sourceCapture {
 func (c *sourceCapture) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Method != http.MethodPost {
 		return nil, fmt.Errorf("unexpected method %s", req.Method)
+	}
+	c.mu.Lock()
+	if c.attempts == nil {
+		c.attempts = map[string]int{}
+		c.arrivals = map[string]time.Time{}
+	}
+	c.attempts[req.URL.String()]++
+	c.arrivals[req.URL.String()] = time.Now()
+	c.mu.Unlock()
+	if c.blockURL != "" && req.URL.String() == c.blockURL {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
 	}
 	if c.failURL != "" && req.URL.String() == c.failURL {
 		return &http.Response{
@@ -455,6 +475,19 @@ func (c *sourceCapture) postedURLs() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.urls...)
+}
+
+func (c *sourceCapture) attemptsTo(url string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.attempts[url]
+}
+
+func (c *sourceCapture) arrivalAt(url string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	at, ok := c.arrivals[url]
+	return at, ok
 }
 
 func (c *sourceCapture) batchCount() int {
@@ -568,8 +601,10 @@ func TestSourcePushAmbiguousPeerAbortsWithoutPOST(t *testing.T) {
 }
 
 // TestSourcePushSoftResolveErrorFallsBackToHostname verifies that soft failures
-// (Tailscale CLI missing, peer not found, peer offline) fall back to the original
-// URL and proceed with the POST, letting HTTP report the connection error.
+// (Tailscale CLI missing, peer not found) fall back to the original URL and
+// proceed with the POST, letting HTTP report the connection error. A peer
+// Tailscale reports offline is skipped instead; see
+// TestSourcePushOfflinePeerIsSkippedAsAsleep.
 func TestSourcePushSoftResolveErrorFallsBackToHostname(t *testing.T) {
 	fx := newSourcePushFixture(t, []chrome.Cookie{
 		{HostKey: ".example.com", Name: "session", Value: "xyz", Path: "/"},
@@ -695,5 +730,196 @@ func TestSourcePushMissingKeyIsolatedNoSilentDowngrade(t *testing.T) {
 	posted := fx.capture.postedURLs()
 	if len(posted) != 1 || posted[0] != urlShared {
 		t.Fatalf("only the shared-secret sink should be posted (no downgrade of the peer'd sink), got %v", posted)
+	}
+}
+
+// --- Push retry backoff (KTD11) ---
+
+// sinkStateFor returns the per-sink record for url, or nil.
+func sinkStateFor(st *state.SourceState, url string) *state.SinkPushState {
+	for i := range st.Sinks {
+		if st.Sinks[i].URL == url {
+			return &st.Sinks[i]
+		}
+	}
+	return nil
+}
+
+// stubSourceClock pins sourceNow to a settable fake time.
+func stubSourceClock(t *testing.T, start time.Time) *time.Time {
+	t.Helper()
+	now := start
+	prev := sourceNow
+	sourceNow = func() time.Time { return now }
+	t.Cleanup(func() { sourceNow = prev })
+	return &now
+}
+
+func TestSourcePushOfflinePeerIsSkippedAsAsleep(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlAsleep := "http://instinct.test/sync"
+	urlAwake := "http://grok-bot.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlAsleep}, {URL: urlAwake}}
+	restore := SetResolveSinkURLForTesting(func(ctx context.Context, rawURL string) (string, error) {
+		if rawURL == urlAsleep {
+			return rawURL, fmt.Errorf("%w: \"instinct\" (all 1 matching nodes are offline)", tsclient.ErrPeerOffline)
+		}
+		return rawURL, nil
+	})
+	defer restore()
+
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("an offline peer is not a push failure, got: %v", err)
+	}
+	if n := fx.capture.attemptsTo(urlAsleep); n != 0 {
+		t.Fatalf("offline peer must not be dialed, got %d POSTs", n)
+	}
+	if n := fx.capture.attemptsTo(urlAwake); n != 1 {
+		t.Fatalf("online peer should get 1 POST, got %d", n)
+	}
+	ps := sinkStateFor(fx.srcState, urlAsleep)
+	if ps == nil {
+		t.Fatal("offline peer should have a per-sink record")
+	}
+	if !ps.Asleep || ps.LastAsleepAt.IsZero() {
+		t.Errorf("offline peer should be recorded asleep, got %+v", ps)
+	}
+	if ps.TotalFailures != 0 || ps.ConsecutiveFailures != 0 || !ps.BackoffUntil.IsZero() {
+		t.Errorf("asleep is not a failure: got %+v", ps)
+	}
+	if fx.srcState.TotalFailures != 0 {
+		t.Errorf("source TotalFailures = %d, want 0", fx.srcState.TotalFailures)
+	}
+}
+
+func TestSourcePushBackoffScheduleCapsAndResetsOnSuccess(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlBad := "http://sink-bad.test/sync"
+	urlGood := "http://sink-good.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlBad}, {URL: urlGood}}
+	fx.capture.failURL = urlBad
+	restore := SetResolveSinkURLForTesting(func(ctx context.Context, rawURL string) (string, error) {
+		return rawURL, nil
+	})
+	defer restore()
+	now := stubSourceClock(t, time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC))
+
+	want := []time.Duration{
+		30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute,
+		8 * time.Minute, 16 * time.Minute, 30 * time.Minute, 30 * time.Minute,
+	}
+	for i, delay := range want {
+		if _, err := fx.push(); err == nil {
+			t.Fatalf("failure %d: expected push error", i+1)
+		}
+		if got := fx.capture.attemptsTo(urlBad); got != i+1 {
+			t.Fatalf("failure %d: bad sink dialed %d times, want %d", i+1, got, i+1)
+		}
+		ps := sinkStateFor(fx.srcState, urlBad)
+		if ps.ConsecutiveFailures != i+1 {
+			t.Fatalf("failure %d: ConsecutiveFailures = %d", i+1, ps.ConsecutiveFailures)
+		}
+		if got := ps.BackoffUntil.Sub(*now); got != delay {
+			t.Fatalf("failure %d: backoff = %s, want %s", i+1, got, delay)
+		}
+		// A push inside the window skips the bad sink but still serves the
+		// healthy one, and is not an error.
+		*now = now.Add(delay - time.Second)
+		if _, err := fx.push(); err != nil {
+			t.Fatalf("failure %d: push inside backoff window should skip, got %v", i+1, err)
+		}
+		if got := fx.capture.attemptsTo(urlBad); got != i+1 {
+			t.Fatalf("failure %d: bad sink dialed inside its backoff window", i+1)
+		}
+		*now = now.Add(time.Second)
+	}
+	if got := sinkStateFor(fx.srcState, urlBad).TotalFailures; got != len(want) {
+		t.Errorf("TotalFailures = %d, want %d (skips are not failures)", got, len(want))
+	}
+	if got := sinkStateFor(fx.srcState, urlGood).TotalPushes; got != 2*len(want) {
+		t.Errorf("healthy sink pushes = %d, want %d", got, 2*len(want))
+	}
+
+	// Recovery resets the schedule.
+	fx.capture.failURL = ""
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("recovered push: %v", err)
+	}
+	ps := sinkStateFor(fx.srcState, urlBad)
+	if ps.ConsecutiveFailures != 0 || !ps.BackoffUntil.IsZero() {
+		t.Fatalf("success should reset backoff, got %+v", ps)
+	}
+	fx.capture.failURL = urlBad
+	_, _ = fx.push()
+	if got := sinkStateFor(fx.srcState, urlBad).BackoffUntil.Sub(*now); got != want[0] {
+		t.Fatalf("first failure after reset: backoff = %s, want %s", got, want[0])
+	}
+}
+
+func TestSourcePushDeadSinkDoesNotDelayOthers(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlDead := "http://sink-dead.test/sync"
+	urlLive := "http://sink-live.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlDead}, {URL: urlLive}}
+	fx.capture.blockURL = urlDead
+	restore := SetResolveSinkURLForTesting(func(ctx context.Context, rawURL string) (string, error) {
+		return rawURL, nil
+	})
+	defer restore()
+
+	budget := 2 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	start := time.Now()
+	_, err := pushWithFreshBlocklist(ctx, fx.cfg, fx.key, false, false, false, fx.srcState, nil)
+	if err == nil {
+		t.Fatal("dead sink should report a failure")
+	}
+	at, ok := fx.capture.arrivalAt(urlLive)
+	if !ok {
+		t.Fatal("live sink was never pushed")
+	}
+	if wait := at.Sub(start); wait > budget/2 {
+		t.Fatalf("live sink waited %s behind the dead one", wait)
+	}
+	if ps := sinkStateFor(fx.srcState, urlLive); ps == nil || ps.TotalPushes != 1 {
+		t.Fatalf("live sink should record 1 push, got %+v", ps)
+	}
+	if ps := sinkStateFor(fx.srcState, urlDead); ps == nil || ps.TotalFailures != 1 {
+		t.Fatalf("dead sink should record 1 failure, got %+v", ps)
+	}
+}
+
+func TestPushTriggerRateCapCollapsesBursts(t *testing.T) {
+	now := stubSourceClock(t, time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC))
+	var pushes int
+	trigger := newRateCappedTrigger(pushTriggerMinInterval, func(context.Context) { pushes++ })
+
+	// A burst from the secrets and discovery watchers sharing one trigger.
+	for range 20 {
+		trigger.fire(context.Background())
+		*now = now.Add(100 * time.Millisecond)
+	}
+	if pushes != 1 {
+		t.Fatalf("burst of 20 triggers ran %d pushes, want 1", pushes)
+	}
+	*now = time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC).Add(pushTriggerMinInterval - time.Millisecond)
+	trigger.fire(context.Background())
+	if pushes != 1 {
+		t.Fatalf("trigger inside the cap ran a push (%d)", pushes)
+	}
+	*now = now.Add(time.Millisecond)
+	trigger.fire(context.Background())
+	if pushes != 2 {
+		t.Fatalf("trigger after the cap should push, got %d", pushes)
 	}
 }
