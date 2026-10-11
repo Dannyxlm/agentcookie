@@ -189,3 +189,17 @@ func TestTeammateStoreNoOpUpdateSkipsWrite(t *testing.T) {
 		t.Fatalf("LaptopDNSName = %q", got)
 	}
 }
+
+// A null teammate record is damaged state: opening fails with an error
+// instead of a later snapshot dereferencing nil.
+func TestTeammateStoreNullRecordIsAnError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "teammates-state.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"teammates":{"grokbot":null}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenTeammateStore(path); err == nil {
+		t.Fatal("a null teammate record was accepted")
+	} else if !strings.Contains(err.Error(), "grokbot") {
+		t.Fatalf("error should name the damaged record: %v", err)
+	}
+}

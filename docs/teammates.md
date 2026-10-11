@@ -84,10 +84,10 @@ curl -fsSL https://raw.githubusercontent.com/mvanhorn/agentcookie/<tag>/scripts/
 ```
 
 - `teammate-install.sh` installs the release for the machine's arch (amd64 or arm64) into `~/.local/bin`. It accepts only an exact release tag, refuses a binary whose SHA256 differs from the one pinned for that arch, and refuses an arch the notice pins no SHA256 for (a release without a `linux_arm64` asset is pinned for amd64 only).
-- `join` writes a pull-mode `sink.yaml` (no listener, with `pull.as` set to `--as`), a sync-all `blocklist.yaml` if none exists, pins the laptop's name, pairs, and pulls once. It is idempotent. It refuses a different `--from` than the pinned laptop unless you pass `--replace`. The proxy is `--proxy`, else the `proxy` saved in the agent's Tincan `client.json`.
+- `join` writes a pull-mode `sink.yaml` (no listener, with `pull.as` set to `--as`), a sync-all `blocklist.yaml` if none exists, pins the laptop's name, pairs, and pulls once. It is idempotent. It refuses a different `--from` than the pinned laptop unless you pass `--replace`. A different `--as` than the one in `sink.yaml` is a different teammate, so `join` pairs again with the supplied code and changes nothing if the laptop refuses it. The proxy is `--proxy`, else the `proxy` saved in the agent's Tincan `client.json`.
 - `agentcookie sink --pull-once` runs at the start of every turn. It holds `~/.agentcookie/pull.lock` (a second run exits 0 at once) and has a 45-second budget with connect retries, so it never hangs a turn.
 - Exit codes: 0 means cookies are current (applied, or nothing new); 3 means the laptop was unreachable within the budget (asleep, offline, or blocked), and existing cookies are untouched; 4 means this machine needs to re-pair (no local key, or the laptop refused it). The laptop starts that re-pair on its own.
-- For `turn+timer`, `--pull-once` also starts one detached pull loop if none is running, pulling every 5 to 15 minutes. A machine with no init system (grokbot) loses the loop on a wipe; the next turn's `--pull-once` starts it again. `$HOME` survives, so the binary and config stay.
+- For `turn+timer`, `--pull-once` also starts one detached pull loop if none is running, pulling every 5 to 15 minutes. A machine with no init system (grokbot) loses the loop on a wipe; the next turn's `--pull-once` starts it again. `$HOME` survives, so the binary and config stay. The loop exits on its own once `sink.yaml` no longer asks for `turn+timer`, and `--pull-once --dry-run` never starts it.
 
 ## Checking on teammates
 

@@ -34,7 +34,8 @@ pairing notice:
 It writes a pull-mode sink.yaml pinned to that laptop (no listener), a
 default blocklist.yaml when none exists, pairs through the laptop's /pair
 on port 9998, and pulls once. Rerunning it is safe: an already-paired
-machine just pulls again.
+machine just pulls again. A different --as than the one in sink.yaml is
+a different teammate, so it pairs again with the supplied code.
 
 The proxy is --proxy, else the "proxy" saved in this agent's Tincan
 client.json (TINCAN_CONFIG, or the default Tincan config path), else the
@@ -141,6 +142,41 @@ func joinTeammate(ctx context.Context, w io.Writer, opts joinOptions) error {
 		return err
 	}
 
+	pair := func() error {
+		client, err := pullHTTPClient(httpserver.PairClient, proxy)
+		if err != nil {
+			return err
+		}
+		res, err := pairing.RunSinkWithClient(ctx, client, pairURL, pairing.Code(opts.Code), opts.As)
+		if err != nil {
+			return fmt.Errorf("pair with %s: %w", from, err)
+		}
+		if err := keystore.Save(dir, &keystore.PeerKey{
+			Peer:        peer,
+			Key:         res.Key,
+			PairedAt:    res.PairedAt,
+			Fingerprint: res.Fingerprint,
+			ProtocolVer: pairing.ProtocolVersion,
+		}); err != nil {
+			return fmt.Errorf("save key: %w", err)
+		}
+		fmt.Fprintf(w, "agentcookie join: paired with %s as %s (fingerprint %s)\n", from, opts.As, res.Fingerprint)
+		return nil
+	}
+
+	pairedNow := false
+	// A different --as is a different teammate: the stored key belongs to
+	// the previous one, so pair with the supplied code before sink.yaml
+	// names the new teammate. A refused code changes nothing.
+	prevAs, _ := prevPull["as"].(string)
+	if prevAs != "" && prevAs != strings.TrimSpace(opts.As) {
+		fmt.Fprintf(w, "agentcookie join: this machine was teammate %s; pairing as %s with the new code\n", prevAs, strings.TrimSpace(opts.As))
+		if err := pair(); err != nil {
+			return err
+		}
+		pairedNow = true
+	}
+
 	if opts.Replace && prevFrom != from {
 		raw = map[string]any{}
 	}
@@ -172,36 +208,15 @@ func joinTeammate(ctx context.Context, w io.Writer, opts joinOptions) error {
 		return err
 	}
 
-	pair := func() error {
-		client, err := pullHTTPClient(httpserver.PairClient, proxy)
-		if err != nil {
-			return err
+	if !pairedNow {
+		if pk, err := keystore.Load(dir, peer); err != nil || pk == nil || len(pk.Key) == 0 {
+			if err := pair(); err != nil {
+				return err
+			}
+			pairedNow = true
+		} else {
+			fmt.Fprintf(w, "agentcookie join: already paired with %s\n", from)
 		}
-		res, err := pairing.RunSinkWithClient(ctx, client, pairURL, pairing.Code(opts.Code), opts.As)
-		if err != nil {
-			return fmt.Errorf("pair with %s: %w", from, err)
-		}
-		if err := keystore.Save(dir, &keystore.PeerKey{
-			Peer:        peer,
-			Key:         res.Key,
-			PairedAt:    res.PairedAt,
-			Fingerprint: res.Fingerprint,
-			ProtocolVer: pairing.ProtocolVersion,
-		}); err != nil {
-			return fmt.Errorf("save key: %w", err)
-		}
-		fmt.Fprintf(w, "agentcookie join: paired with %s as %s (fingerprint %s)\n", from, opts.As, res.Fingerprint)
-		return nil
-	}
-
-	pairedNow := false
-	if pk, err := keystore.Load(dir, peer); err != nil || pk == nil || len(pk.Key) == 0 {
-		if err := pair(); err != nil {
-			return err
-		}
-		pairedNow = true
-	} else {
-		fmt.Fprintf(w, "agentcookie join: already paired with %s\n", from)
 	}
 	err = runSinkPullOnce(ctx, w)
 	if ec, ok := errors.AsType[*exitCodeError](err); ok && ec.code == pullExitRepair && !pairedNow {

@@ -46,6 +46,10 @@ type teammateHub struct {
 	present bool                    // teammates.yaml exists
 	cfg     *config.TeammatesConfig // last file that loaded; nil before any
 	loadErr error                   // non-nil: teammate pull and pair suspended
+	// saveErr is a required teammate state save that failed. It suspends
+	// teammate pull and pair for the rest of the process: a reload does
+	// not clear it, because the transition it lost is not on disk.
+	saveErr error
 	// legacyPeers are the peer names of source.yaml push sinks; a listed
 	// name among them is migrated to teammate mode.
 	legacyPeers []string
@@ -179,7 +183,35 @@ func (h *teammateHub) Suspended() error {
 	}
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.loadErr
+	if h.loadErr != nil {
+		return h.loadErr
+	}
+	return h.saveErr
+}
+
+// saveFailed returns the failed required state save, or nil.
+func (h *teammateHub) saveFailed() error {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.saveErr
+}
+
+// suspendForSave suspends teammate pull and pair after a required state
+// save failed, and cancels every pending pairing code. It stays in force
+// until the daemon restarts and reloads teammates-state.json.
+func (h *teammateHub) suspendForSave(err error) {
+	h.mu.Lock()
+	first := h.saveErr == nil
+	if first {
+		h.saveErr = fmt.Errorf("teammate state could not be saved (%w); restart agentcookie once ~/.agentcookie is writable", err)
+	}
+	h.mu.Unlock()
+	h.pairings.mu.Lock()
+	clear(h.pairings.byName)
+	h.pairings.mu.Unlock()
+	if first {
+		fmt.Fprintf(h.log, "agentcookie source: teammates suspended: %v\n", h.Suspended())
+	}
 }
 
 // IsListed reports whether name is a listed teammate in a file that loaded.
@@ -233,12 +265,43 @@ func (h *teammateHub) IsTeammateName(name string) bool {
 	return h.store.IsMigrated(name)
 }
 
+// errTeammateHistoryUnknown holds a named push while the hub cannot tell
+// whether the peer is, or once was, a teammate.
+var errTeammateHistoryUnknown = errors.New("push held: teammate state is unavailable, so this peer cannot be told apart from a teammate; fix ~/.agentcookie/teammates-state.json (or teammates.yaml) and restart agentcookie")
+
+// historyUnknown reports whether a peer name cannot be checked against
+// teammate history: the state store (which remembers migrated and removed
+// teammates) is unavailable, or teammates.yaml exists but no good copy has
+// loaded since the daemon started.
+func (h *teammateHub) historyUnknown() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.store == nil || (h.present && h.loadErr != nil && h.cfg == nil)
+}
+
+// PushHeld returns errTeammateHistoryUnknown when the legacy push to a
+// named peer must be held because its teammate history cannot be checked
+// (fail closed: a removed migrated teammate is never pushed again). A
+// peerless legacy sink is never a teammate and is never held.
+func (h *teammateHub) PushHeld(peer string) error {
+	if peer != "" && h.historyUnknown() {
+		return errTeammateHistoryUnknown
+	}
+	return nil
+}
+
 // SuppressPush reports whether the legacy push to peer must be skipped: the
-// peer was migrated to teammate mode (persisted, survives removal), or it is
-// listed right now.
+// peer was migrated to teammate mode (persisted, survives removal), it is
+// listed right now, or its teammate history cannot be checked (PushHeld).
 func (h *teammateHub) SuppressPush(peer string) bool {
 	if h == nil || peer == "" {
 		return false
+	}
+	if h.PushHeld(peer) != nil {
+		return true
 	}
 	h.mu.RLock()
 	listed := h.present && h.cfg.Has(peer)
@@ -246,7 +309,7 @@ func (h *teammateHub) SuppressPush(peer string) bool {
 	if listed {
 		return true
 	}
-	return h.store != nil && h.store.IsMigrated(peer)
+	return h.store.IsMigrated(peer)
 }
 
 // Watch hot-reloads teammates.yaml on fsnotify events until ctx ends. It

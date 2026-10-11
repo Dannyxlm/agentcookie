@@ -147,7 +147,7 @@ func runSink(cmd *cobra.Command, args []string) error {
 	}
 
 	logSinkStartupBlocklistStatus()
-	registerCmuxSurface(cfg)
+	registerCmuxSurfaceOnce(cfg)
 
 	if pullFrom != "" {
 		pullURL, err := normalizePullURL(pullFrom)
@@ -242,12 +242,24 @@ func (rt *sinkRuntime) applier(ctx context.Context, transportSecret string) func
 	}
 }
 
+// cmuxRegisterOnce makes registerCmuxSurfaceOnce register at most once
+// per process. Tests replace it.
+var cmuxRegisterOnce = new(sync.Once)
+
+// registerCmuxSurfaceOnce registers the cmux surface from cfg the first
+// time any sink mode (listener, pull loop, pull-once, background loop)
+// loads its config in this process.
+func registerCmuxSurfaceOnce(cfg *config.SinkConfig) {
+	cmuxRegisterOnce.Do(func() { registerCmuxSurface(cfg) })
+}
+
 // registerCmuxSurface registers the opt-in cmux delivery surface (sink.yaml
 // `cmux.enabled`). Registered here, not in sinkpush.init(), because it
 // carries config (binary path, host filter) the package-load init cannot
 // see. Once registered it fires after every sync via sinkpush.RunAll
 // alongside the built-in per-CLI adapters, and shows up in `doctor` and
-// `wizard verify-adapters` for free. Call once per process.
+// `wizard verify-adapters` for free. Call it through
+// registerCmuxSurfaceOnce.
 func registerCmuxSurface(cfg *config.SinkConfig) {
 	if cfg.Cmux.Enabled {
 		sinkpush.Register(sinkpush.NewCmux(cfg.Cmux.CmuxPath, cfg.Cmux.DomainFilter))

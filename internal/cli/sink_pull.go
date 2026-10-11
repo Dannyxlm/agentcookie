@@ -64,19 +64,31 @@ func runSinkPullLoop(
 ) error {
 	apply := rt.applier(ctx, transportSecret)
 	return pullLoop(ctx, true, func() time.Duration { return interval }, func(ctx context.Context) error {
-		_, err := pullFromSource(ctx, client, pullURL, transportSecret, "", apply)
+		_, err := pullFromSource(ctx, client, pullURL, transportSecret, rt.cfg.Pull.As, apply)
 		return err
 	})
 }
 
+// errPullLoopDone is returned by a poll to end pullLoop cleanly.
+var errPullLoopDone = errors.New("pull loop done")
+
 // pullLoop is the continuous pull loop: poll (first right away when
-// pollFirst), then again after each next() interval, until ctx ends. Poll
-// errors are logged and never stop the loop.
+// pollFirst), then again after each next() interval, until ctx ends or a
+// poll returns errPullLoopDone. Other poll errors are logged and never
+// stop the loop.
 func pullLoop(ctx context.Context, pollFirst bool, next func() time.Duration, poll func(context.Context) error) error {
-	if pollFirst {
-		if err := poll(ctx); err != nil {
+	run := func() bool {
+		err := poll(ctx)
+		if errors.Is(err, errPullLoopDone) {
+			return false
+		}
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "agentcookie sink: pull: %v\n", err)
 		}
+		return true
+	}
+	if pollFirst && !run() {
+		return nil
 	}
 	for {
 		timer := time.NewTimer(next())
@@ -85,8 +97,8 @@ func pullLoop(ctx context.Context, pollFirst bool, next func() time.Duration, po
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
-			if err := poll(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: pull: %v\n", err)
+			if !run() {
+				return nil
 			}
 		}
 	}
@@ -283,7 +295,8 @@ type pullOnceResult struct {
 // runSinkPullOnce is `agentcookie sink --pull-once`: one pull from the
 // laptop pinned in sink.yaml, under pull.lock, inside pullOnceBudget. A
 // second invocation while one runs exits 0 at once. For cadence
-// turn+timer it also makes sure one background pull loop is running.
+// turn+timer it also makes sure one background pull loop is running,
+// except under --dry-run.
 func runSinkPullOnce(ctx context.Context, w io.Writer) error {
 	cfg, err := config.LoadSink(common.ConfigDir)
 	if err != nil {
@@ -301,9 +314,11 @@ func runSinkPullOnce(ctx context.Context, w io.Writer) error {
 		return nil
 	}
 	defer lock.Close()
+	registerCmuxSurfaceOnce(cfg)
 
 	res := pullOnceLocked(ctx, cfg)
-	if cfg.Pull.Cadence == config.CadenceTurnTimer && res.code != pullExitRepair {
+	// A dry run never starts the loop: the loop writes real cookies.
+	if cfg.Pull.Cadence == config.CadenceTurnTimer && res.code != pullExitRepair && !sinkDryRun {
 		if err := ensurePullLoop(w); err != nil {
 			fmt.Fprintf(os.Stderr, "agentcookie pull-once: background pull loop: %v\n", err)
 		}
@@ -352,7 +367,9 @@ func pullOnceLocked(ctx context.Context, cfg *config.SinkConfig) pullOnceResult 
 			rt.st = prev
 		}
 	}
-	apply := rt.applier(ctx, string(pk.Key))
+	// The apply step (Chrome connection, cookie writes) shares the budget,
+	// so a stalled Chrome cannot hold the agent's turn past it.
+	apply := pullApplier(rt, budgetCtx, string(pk.Key))
 
 	delay := pullOnceRetryMin
 	for {
@@ -384,6 +401,12 @@ func pullOnceLocked(ctx context.Context, cfg *config.SinkConfig) pullOnceResult 
 		}
 		delay = min(delay*2, pullOnceRetryMax)
 	}
+}
+
+// pullApplier builds the envelope apply step for one pull-once. Tests
+// replace it.
+var pullApplier = func(rt *sinkRuntime, ctx context.Context, secret string) func([]byte) envelopeApplyResult {
+	return rt.applier(ctx, secret)
 }
 
 // pullLoopCommand builds the detached background loop process. Tests
@@ -432,7 +455,8 @@ func ensurePullLoop(w io.Writer) error {
 // runTeammatePullLoop is the detached loop (`sink --pull-loop`). It holds
 // the pidfile lock for its life, and runs the continuous pull loop with a
 // 5 to 15 minute jittered interval. Each iteration takes pull.lock and
-// skips when a --pull-once holds it.
+// skips when a --pull-once holds it. It exits once sink.yaml no longer
+// asks for cadence turn+timer.
 func runTeammatePullLoop(ctx context.Context) error {
 	f, ok, err := tryLock(pullLoopPidPath())
 	if err != nil {
@@ -452,9 +476,11 @@ func runTeammatePullLoop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if !cfg.PullMode() {
-			return fmt.Errorf("sink.yaml has no pull.from")
+		if !cfg.PullMode() || cfg.Pull.Cadence != config.CadenceTurnTimer {
+			fmt.Fprintln(os.Stderr, "agentcookie sink --pull-loop: sink.yaml no longer asks for cadence turn+timer; exiting")
+			return errPullLoopDone
 		}
+		registerCmuxSurfaceOnce(cfg)
 		lock, ok, err := tryLock(pullLockPath())
 		if err != nil {
 			return err

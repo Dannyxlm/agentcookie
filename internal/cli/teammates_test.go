@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -289,4 +290,48 @@ func readCLIFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// A removed migrated legacy peer stays off push when the state file that
+// remembers its migration cannot be read: every named push is held (and
+// reported as failed) until teammate history can be checked again. A
+// peerless legacy sink is not a teammate name and is still pushed.
+func TestPushHeldWhileTeammateStateUnavailable(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	instinctURL := "http://instinct:9999/sync"
+	otherURL := "http://other.test/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: instinctURL, Peer: "instinct"}, {URL: otherURL}}
+	if err := keystore.Save(fx.configDir, &keystore.PeerKey{Peer: "instinct", Key: []byte(fx.secret)}); err != nil {
+		t.Fatal(err)
+	}
+	for _, list := range []string{"", "teammates:\n  - name: grokbot\n"} {
+		if list != "" {
+			writeTeammatesFile(t, fx.configDir, list)
+		}
+		hub := newTeammateHub(fx.configDir, nil, []string{"instinct"})
+		hub.log = io.Discard
+		_ = hub.Reload()
+		prev := activeTeammates
+		activeTeammates = hub
+
+		if !hub.SuppressPush("instinct") {
+			t.Fatalf("list %q: SuppressPush(instinct) = false with the state store unavailable", list)
+		}
+		before := len(fx.capture.postedURLs())
+		_, err := fx.push()
+		activeTeammates = prev
+		if err == nil || !strings.Contains(err.Error(), "teammate state") {
+			t.Fatalf("list %q: held push to instinct not reported as a failure: %v", list, err)
+		}
+		posted := fx.capture.postedURLs()[before:]
+		if got := countURL(posted, instinctURL); got != 0 {
+			t.Fatalf("list %q: instinct got %d POSTs while teammate history is unknown, want 0", list, got)
+		}
+		if got := countURL(posted, otherURL); got != 1 {
+			t.Fatalf("list %q: peerless sink got %d POSTs, want 1", list, got)
+		}
+	}
 }

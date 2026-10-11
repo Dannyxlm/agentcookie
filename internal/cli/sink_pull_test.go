@@ -21,8 +21,10 @@ import (
 	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
+	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/keystore"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
+	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
 )
@@ -541,5 +543,125 @@ func TestPullOnceTurnCadenceStartsNoLoop(t *testing.T) {
 	t.Cleanup(func() { pullLoopCommand = prev })
 	if code, _ := ts.pullOnce(t); code != 0 {
 		t.Fatalf("code = %d", code)
+	}
+}
+
+// The apply step runs inside the pull-once budget: a stalled Chrome
+// connection cannot hold the agent's turn past it.
+func TestPullOnceApplyStaysInsideBudget(t *testing.T) {
+	ts := newTeammateSink(t, "turn", "")
+	prev := pullApplier
+	pullApplier = func(_ *sinkRuntime, ctx context.Context, _ string) func([]byte) envelopeApplyResult {
+		return func([]byte) envelopeApplyResult {
+			select {
+			case <-ctx.Done():
+				return envelopeApplyResult{Status: http.StatusGatewayTimeout, Reply: ctx.Err().Error()}
+			case <-time.After(5 * time.Second):
+				return envelopeApplyResult{Status: http.StatusOK}
+			}
+		}
+	}
+	t.Cleanup(func() { pullApplier = prev })
+
+	start := time.Now()
+	code, out := ts.pullOnce(t)
+	if elapsed := time.Since(start); elapsed > pullOnceBudget+time.Second {
+		t.Fatalf("apply outlasted the %s budget: took %s (code=%d out=%q)", pullOnceBudget, elapsed, code, out)
+	}
+	if code == 0 {
+		t.Fatalf("a stalled apply must not report success: out=%q", out)
+	}
+}
+
+// cmux.enabled reaches cmux in --pull-once too, registered once.
+func TestPullOnceRegistersCmuxSurfaceOnce(t *testing.T) {
+	ts := newTeammateSink(t, "turn", "")
+	f, err := os.OpenFile(filepath.Join(ts.dir, "sink.yaml"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("cmux:\n  enabled: true\n  cmux_path: /nonexistent/cmux\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	t.Cleanup(sinkpush.SetRegistryForTesting(nil))
+	prevOnce := cmuxRegisterOnce
+	cmuxRegisterOnce = new(sync.Once)
+	t.Cleanup(func() { cmuxRegisterOnce = prevOnce })
+
+	for range 2 {
+		if code, out := ts.pullOnce(t); code != 0 {
+			t.Fatalf("code=%d out=%q", code, out)
+		}
+	}
+	n := 0
+	for _, a := range sinkpush.All() {
+		if a.Name() == "cmux" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("cmux registered %d times, want 1", n)
+	}
+}
+
+// --pull-once --dry-run never starts a background loop that would write
+// cookies later.
+func TestPullOnceDryRunStartsNoLoop(t *testing.T) {
+	ts := newTeammateSink(t, "turn+timer", "")
+	prevDry := sinkDryRun
+	sinkDryRun = true
+	t.Cleanup(func() { sinkDryRun = prevDry })
+	prev := pullLoopCommand
+	pullLoopCommand = func() (*exec.Cmd, error) { t.Fatal("a dry run started a writing background loop"); return nil, nil }
+	t.Cleanup(func() { pullLoopCommand = prev })
+	if code, out := ts.pullOnce(t); code != 0 {
+		t.Fatalf("code=%d out=%q", code, out)
+	}
+}
+
+// Plain `sink` in pull mode names the configured teammate on its pulls,
+// so a laptop with two teammates on one node can re-pair the right one.
+func TestSinkPullLoopSendsConfiguredTeammate(t *testing.T) {
+	ts := newTeammateSink(t, "turn", "")
+	cfg, err := config.LoadSink(ts.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := newSinkRuntime(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pullURL, err := normalizePullURL(cfg.Pull.From)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runSinkPullLoop(ctx, nil, rt, ts.key, pullURL, time.Hour) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for ts.hits.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if got, _ := ts.asHeader.Load().(string); got != "grokbot" {
+		t.Fatalf("X-Agentcookie-Teammate = %q, want grokbot (pull.as)", got)
+	}
+}
+
+// The background loop exits once sink.yaml no longer asks for a timer.
+func TestTeammatePullLoopExitsWhenCadenceIsTurn(t *testing.T) {
+	ts := newTeammateSink(t, "turn", "")
+	prev := teammatePullInterval
+	teammatePullInterval = func() time.Duration { return 10 * time.Millisecond }
+	t.Cleanup(func() { teammatePullInterval = prev })
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := runTeammatePullLoop(ctx); err != nil {
+		t.Fatalf("loop did not exit on its own for cadence turn: %v", err)
+	}
+	if ts.hits.Load() != 0 {
+		t.Fatalf("loop pulled %d times for cadence turn, want 0", ts.hits.Load())
 	}
 }

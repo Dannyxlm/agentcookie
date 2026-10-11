@@ -160,3 +160,32 @@ func TestJoinUsesTincanClientJSONProxy(t *testing.T) {
 		t.Fatalf("proxied requests = %d, want the /pair and the /pull", proxied.Load())
 	}
 }
+
+// Joining as a different teammate on an already-paired machine pairs with
+// the supplied code instead of reusing the first teammate's key. A code
+// the laptop refuses leaves sink.yaml and the stored key untouched.
+func TestJoinAsDifferentTeammatePairsWithNewCode(t *testing.T) {
+	f := newJoinFixture(t)
+	if out, err := f.join(joinOptions{From: f.from, Code: f.mint(t), As: "grokbot"}); err != nil {
+		t.Fatalf("join: %v\n%s", err, out)
+	}
+	before := f.read(t, "sink.yaml")
+	keyBefore, err := keystore.Load(f.dir, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := f.join(joinOptions{From: f.from, Code: "AAAA-BBBB-CCCC", As: "instinct"})
+	if err == nil {
+		t.Fatalf("join as a second teammate reused the first one's key: %s", out)
+	}
+	if strings.Contains(out, "already paired") {
+		t.Fatalf("identity change treated as already paired: %q", out)
+	}
+	if after := f.read(t, "sink.yaml"); after != before {
+		t.Fatalf("a refused identity change rewrote sink.yaml:\n%s\n->\n%s", before, after)
+	}
+	keyAfter, err := keystore.Load(f.dir, "127.0.0.1")
+	if err != nil || string(keyAfter.Key) != string(keyBefore.Key) {
+		t.Fatalf("a refused identity change touched the stored key: %v", err)
+	}
+}

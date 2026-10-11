@@ -643,13 +643,15 @@ func pushOnce(
 	for _, sink := range sinks {
 		// A legacy push peer migrated to teammate mode is never dialed
 		// again (it pulls instead). It is skipped silently, not recorded
-		// as a failure, and source.yaml is left untouched.
-		if activeTeammates.SuppressPush(sink.Peer) {
-			continue
-		}
+		// as a failure, and source.yaml is left untouched. While teammate
+		// history cannot be checked, a named push is held and reported as
+		// failed instead (fail closed).
 		r := sinkResult{Peer: sink.Peer, URL: sink.URL}
-		secret, secErr := resolveSinkSecret(common.ConfigDir, sink, cfg.Security.SharedSecret)
-		if secErr != nil {
+		if held := activeTeammates.PushHeld(sink.Peer); held != nil {
+			r.Err = held
+		} else if activeTeammates.SuppressPush(sink.Peer) {
+			continue
+		} else if secret, secErr := resolveSinkSecret(common.ConfigDir, sink, cfg.Security.SharedSecret); secErr != nil {
 			r.Err = secErr
 		} else if sealed, sealErr := transport.SealWithSecret(payload, secret); sealErr != nil {
 			r.Err = fmt.Errorf("seal payload: %w", sealErr)

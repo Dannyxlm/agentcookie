@@ -705,3 +705,60 @@ func TestLifecycleDialogErrorPostsApproveCommand(t *testing.T) {
 		t.Fatalf("a failed dialog must bind nothing: %+v", rec)
 	}
 }
+
+// A transition whose state save fails stops: none of its actions run (the
+// old machine's key stays, no dialog is shown), and teammate pulls and
+// pairing are suspended rather than continuing on the stale binding.
+func TestLifecycleFailedSaveStopsTransitionAndSuspends(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	h.approved()
+	h.pairedNow()
+	if err := keystore.Save(h.dir, &keystore.PeerKey{Peer: "grokbot", Key: []byte("old-machine-key")}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Move the store onto a directory whose saves fail.
+	stateDir := t.TempDir()
+	statePath := filepath.Join(stateDir, "teammates-state.json")
+	data, err := json.Marshal(h.hub.store.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenTeammateStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.hub.store = store
+	if err := os.Chmod(stateDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+
+	dialogsBefore := h.dialogCount()
+	h.setRoster(grokEntry("nNEW", "grok-bot-2", time.Time{}))
+	h.lc.syncAll(context.Background())
+
+	if _, err := keystore.Load(h.dir, "grokbot"); err != nil {
+		t.Fatalf("a transition that was not saved deleted the key: %v", err)
+	}
+	if h.dialogCount() != dialogsBefore {
+		t.Fatal("a transition that was not saved showed a dialog")
+	}
+	if h.hub.Suspended() == nil {
+		t.Fatal("a failed required state save must suspend teammate access")
+	}
+	if d := h.hub.authorizeTeammatePull(httptestRequest(), "grokbot", "secret"); d.status == 0 {
+		t.Fatal("pulls must be refused while teammate state cannot be saved")
+	}
+	if _, _, err := h.hub.MintPairing("grokbot", "nGROK"); err == nil {
+		t.Fatal("pairing must be refused while teammate state cannot be saved")
+	}
+	// A teammates.yaml reload does not lift the suspension.
+	_ = h.hub.Reload()
+	if h.hub.Suspended() == nil {
+		t.Fatal("a reload lifted the state-save suspension")
+	}
+}

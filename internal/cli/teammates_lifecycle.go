@@ -155,8 +155,12 @@ func (l *teammateLifecycle) memFor(name string) *tmMem {
 }
 
 // apply runs one event through stepTeammate for name, saves the fields it
-// changed, and runs its actions.
+// changed, and runs its actions. A failed save runs no actions and
+// suspends teammate access (suspendForSave).
 func (l *teammateLifecycle) apply(ctx context.Context, name string, ev tmEvent) error {
+	if err := l.hub.saveFailed(); err != nil {
+		return err // no transition runs on top of state that was not saved
+	}
 	before, _ := l.hub.store.Record(name)
 	m := l.memFor(name)
 	m.CodeLive = l.hub.pairingPending(name)
@@ -165,7 +169,10 @@ func (l *teammateLifecycle) apply(ctx context.Context, name string, ev tmEvent) 
 		mergeRecord(st.Teammate(name), before, next.Rec)
 		return nil
 	}); err != nil {
-		l.logf("teammates: %v", err)
+		// Fail closed: the transition is not on disk, so none of its
+		// actions run and teammate access stops until a restart.
+		l.hub.suspendForSave(err)
+		return fmt.Errorf("teammate %s: %w", name, err)
 	}
 	*m = next.Mem
 	if before.Phase != next.Rec.Phase && next.Rec.Phase != "" {

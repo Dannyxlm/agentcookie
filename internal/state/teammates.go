@@ -231,6 +231,11 @@ func OpenTeammateStore(path string) (*TeammateStore, error) {
 	if err := json.Unmarshal(data, &s.st); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", path, err)
 	}
+	for name, rec := range s.st.Teammates {
+		if rec == nil {
+			return nil, fmt.Errorf("decode %s: teammate %q has a null record", path, name)
+		}
+	}
 	if s.st.Version == 0 {
 		s.st.Version = TeammatesStateVersion
 	} else {
