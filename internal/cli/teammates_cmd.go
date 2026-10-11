@@ -354,23 +354,7 @@ func editTeammatesYAML(path string, edit func(doc *yaml.Node) (bool, error)) (bo
 	if fi, err := os.Stat(path); err == nil {
 		mode = fi.Mode().Perm()
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
-	if err != nil {
-		return false, err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(buf.Bytes()); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
+	if err := writeFileAtomic(path, buf.Bytes(), mode); err != nil {
 		return false, err
 	}
 	return true, nil

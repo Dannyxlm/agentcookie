@@ -182,7 +182,7 @@ func (h *teammateHub) pairHandler(localHostname string) http.Handler {
 				h.CancelPairing(p.Name)
 				return "", "", &pairing.PairError{Status: http.StatusForbidden, Msg: "teammate's approved machine changed"}
 			}
-			node, err := h.whois.lookup(r.Context(), remoteIP(r))
+			node, err := h.whois.lookup(r.Context(), pairing.ClientIP(r))
 			if err != nil {
 				return "", "", &pairing.PairError{Status: http.StatusForbidden, Msg: "cannot verify Tailscale node"}
 			}

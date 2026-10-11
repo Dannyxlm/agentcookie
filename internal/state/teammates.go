@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -207,6 +208,9 @@ type TeammateStore struct {
 	mu     sync.Mutex
 	st     TeammatesState
 	writer *Writer
+	// persisted reports that the file on disk holds st (it was loaded or
+	// last saved), so an Update that changes nothing can skip the write.
+	persisted bool
 }
 
 // OpenTeammateStore loads path. A missing file starts empty; an unreadable
@@ -225,6 +229,8 @@ func OpenTeammateStore(path string) (*TeammateStore, error) {
 	}
 	if s.st.Version == 0 {
 		s.st.Version = TeammatesStateVersion
+	} else {
+		s.persisted = true
 	}
 	return s, nil
 }
@@ -256,6 +262,8 @@ func (s *TeammateStore) IsMigrated(name string) bool {
 
 // Update applies fn to the state and saves it. If fn returns an error or
 // the save fails, the in-memory state is left as it was before the call.
+// An Update that leaves the state unchanged skips the write once the file
+// on disk already holds the current state.
 func (s *TeammateStore) Update(fn func(*TeammatesState) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -264,9 +272,13 @@ func (s *TeammateStore) Update(fn func(*TeammatesState) error) error {
 		return err
 	}
 	next.Version = TeammatesStateVersion
+	if s.persisted && reflect.DeepEqual(next, s.st) {
+		return nil
+	}
 	if err := s.writer.Save(&next); err != nil {
 		return fmt.Errorf("save teammates state: %w", err)
 	}
 	s.st = next
+	s.persisted = true
 	return nil
 }

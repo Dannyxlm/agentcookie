@@ -509,3 +509,28 @@ func httptestRequest() *http.Request {
 	r.RemoteAddr = "100.64.0.9:41000"
 	return r
 }
+
+// laptopName asks Tailscale only while no name is stored, so a sync
+// cycle that already refreshed the name does not run `tailscale status`
+// again for each pairing notice.
+func TestLifecycleLaptopNameUsesStoredName(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	ctx := context.Background()
+	var calls int
+	laptopDNSNameFunc = func(context.Context) (string, error) {
+		calls++
+		return "mac-laptop.tail2b6977.ts.net", nil
+	}
+	if name, err := h.lc.laptopName(ctx); err != nil || name != "mac-laptop.tail2b6977.ts.net" {
+		t.Fatalf("laptopName = %q, %v", name, err)
+	}
+	if calls != 1 {
+		t.Fatalf("Tailscale calls with no stored name = %d, want 1", calls)
+	}
+	if name, err := h.lc.laptopName(ctx); err != nil || name != "mac-laptop.tail2b6977.ts.net" {
+		t.Fatalf("laptopName = %q, %v", name, err)
+	}
+	if calls != 1 {
+		t.Fatalf("Tailscale calls with a stored name = %d, want 1", calls)
+	}
+}

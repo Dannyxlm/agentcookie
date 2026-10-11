@@ -3,11 +3,11 @@ package cli
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"sync"
 	"time"
 
+	"github.com/mvanhorn/agentcookie/internal/pairing"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
 	"github.com/mvanhorn/agentcookie/internal/tsclient"
@@ -29,13 +29,19 @@ func SetWhoIsForTesting(f func(ctx context.Context, ip string) (*tsclient.WhoIsR
 // without asking Tailscale again.
 const whoisCacheTTL = 5 * time.Minute
 
+// whoisErrorTTL bounds how long a failed lookup for a remote IP is
+// remembered. A failure still fails closed; this only stops a burst of
+// requests from one IP shelling out to `tailscale whois` each time.
+const whoisErrorTTL = 15 * time.Second
+
 type whoisEntry struct {
 	res *tsclient.WhoIsResult
+	err error
 	at  time.Time
 }
 
-// whoisCache memoizes successful WhoIs answers per remote IP. Errors are
-// never cached, so a transient failure is retried on the next request.
+// whoisCache memoizes WhoIs answers per remote IP: a success for
+// whoisCacheTTL, an error for whoisErrorTTL.
 type whoisCache struct {
 	mu      sync.Mutex
 	now     func() time.Time
@@ -46,7 +52,7 @@ func newWhoisCache(now func() time.Time) *whoisCache {
 	return &whoisCache{now: now, entries: make(map[string]whoisEntry)}
 }
 
-// clear forgets every cached answer.
+// clear forgets every cached answer, failures included.
 func (c *whoisCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -56,17 +62,30 @@ func (c *whoisCache) clear() {
 func (c *whoisCache) lookup(ctx context.Context, ip string) (*tsclient.WhoIsResult, error) {
 	now := c.now()
 	c.mu.Lock()
-	if e, ok := c.entries[ip]; ok && now.Sub(e.at) < whoisCacheTTL {
-		c.mu.Unlock()
-		return e.res, nil
+	if e, ok := c.entries[ip]; ok {
+		if e.err != nil && now.Sub(e.at) < whoisErrorTTL {
+			c.mu.Unlock()
+			return nil, e.err
+		}
+		if e.err == nil && now.Sub(e.at) < whoisCacheTTL {
+			c.mu.Unlock()
+			return e.res, nil
+		}
 	}
 	c.mu.Unlock()
 	res, err := whoIsFunc(ctx, ip)
-	if err != nil {
-		return nil, err
+	if err == nil && (res == nil || res.StableID == "") {
+		err = fmt.Errorf("whois %s: no node StableID", ip)
 	}
-	if res == nil || res.StableID == "" {
-		return nil, fmt.Errorf("whois %s: no node StableID", ip)
+	if err != nil {
+		// A canceled or timed-out request says nothing about the IP, so
+		// only a failure under a live context is remembered.
+		if ctx.Err() == nil {
+			c.mu.Lock()
+			c.entries[ip] = whoisEntry{err: err, at: now}
+			c.mu.Unlock()
+		}
+		return nil, err
 	}
 	c.mu.Lock()
 	c.entries[ip] = whoisEntry{res: res, at: now}
@@ -208,7 +227,7 @@ func (h *teammateHub) authorizeTeammatePull(r *http.Request, name, secret string
 		h.recordPull(name, "refused: machine not approved yet")
 		return denyPull(http.StatusForbidden, "teammate machine not approved")
 	}
-	node, err := h.whois.lookup(r.Context(), remoteIP(r))
+	node, err := h.whois.lookup(r.Context(), pairing.ClientIP(r))
 	if err != nil {
 		h.recordPull(name, "refused: cannot verify Tailscale node: "+err.Error())
 		return denyPull(http.StatusForbidden, "cannot verify Tailscale node")
@@ -262,7 +281,7 @@ func (h *teammateHub) checkKeyLost(r *http.Request) {
 	if len(bound) == 0 {
 		return
 	}
-	node, err := h.whois.lookup(r.Context(), remoteIP(r))
+	node, err := h.whois.lookup(r.Context(), pairing.ClientIP(r))
 	if err != nil {
 		return
 	}
@@ -271,12 +290,4 @@ func (h *teammateHub) checkKeyLost(r *http.Request) {
 		return
 	}
 	h.emit(TeammateEvent{Kind: TeammateKeyLost, Name: name, NodeID: node.StableID, RemoteAddr: r.RemoteAddr, At: h.now()})
-}
-
-func remoteIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

@@ -532,9 +532,13 @@ func (l *teammateLifecycle) refreshLaptopName(ctx context.Context) {
 	}
 }
 
-// laptopName is the laptop's MagicDNS name, fresh if Tailscale answers,
-// else the last one discovered.
+// laptopName is the laptop's MagicDNS name as last discovered. syncAll
+// refreshes it every cycle, so Tailscale is asked here only when no name
+// has been discovered yet.
 func (l *teammateLifecycle) laptopName(ctx context.Context) (string, error) {
+	if name := l.hub.store.Snapshot().LaptopDNSName; name != "" {
+		return name, nil
+	}
 	l.refreshLaptopName(ctx)
 	if name := l.hub.store.Snapshot().LaptopDNSName; name != "" {
 		return name, nil
@@ -608,23 +612,7 @@ func writeJSONFile(path string, v any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	return writeFileAtomic(path, append(data, '\n'), 0o600)
 }
 
 // config returns the last teammates.yaml that loaded (nil before any).

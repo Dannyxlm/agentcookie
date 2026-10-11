@@ -59,9 +59,9 @@ func TestClientIP_HandlesHostOnly(t *testing.T) {
 	for _, c := range cases {
 		r := httptest.NewRequest("POST", "/", nil)
 		r.RemoteAddr = c.in
-		got := clientIP(r)
+		got := ClientIP(r)
 		if got != c.want {
-			t.Errorf("clientIP(%q) = %q want %q", c.in, got, c.want)
+			t.Errorf("ClientIP(%q) = %q want %q", c.in, got, c.want)
 		}
 	}
 }

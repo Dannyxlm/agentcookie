@@ -341,3 +341,81 @@ func TestConcurrentTeammatePullsAllSucceed(t *testing.T) {
 		t.Fatalf("%d of 50 concurrent pulls failed", n)
 	}
 }
+
+func TestWhoisCacheRemembersErrorsFifteenSeconds(t *testing.T) {
+	var calls int
+	var fail bool
+	restore := SetWhoIsForTesting(func(_ context.Context, ip string) (*tsclient.WhoIsResult, error) {
+		calls++
+		if fail {
+			return nil, errors.New("tailscaled not running")
+		}
+		return &tsclient.WhoIsResult{StableID: grokNode}, nil
+	})
+	t.Cleanup(restore)
+	now := time.Now()
+	c := newWhoisCache(func() time.Time { return now })
+	ctx := context.Background()
+
+	fail = true
+	for i := range 2 {
+		if res, err := c.lookup(ctx, grokIP); err == nil || res != nil {
+			t.Fatalf("lookup %d after error = %v, %v; want an error", i, res, err)
+		}
+		now = now.Add(5 * time.Second)
+	}
+	if calls != 1 {
+		t.Fatalf("WhoIs calls within 15s of an error = %d, want 1", calls)
+	}
+	now = now.Add(6 * time.Second)
+	if _, err := c.lookup(ctx, grokIP); err == nil {
+		t.Fatal("lookup after error expiry succeeded; want an error")
+	}
+	if calls != 2 {
+		t.Fatalf("WhoIs calls after error expiry = %d, want 2", calls)
+	}
+
+	fail = false
+	now = now.Add(16 * time.Second)
+	if res, err := c.lookup(ctx, grokIP); err != nil || res.StableID != grokNode {
+		t.Fatalf("lookup = %v, %v", res, err)
+	}
+	now = now.Add(4 * time.Minute)
+	if _, err := c.lookup(ctx, grokIP); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 3 {
+		t.Fatalf("WhoIs calls with a cached success = %d, want 3", calls)
+	}
+	now = now.Add(time.Minute + time.Second)
+	if _, err := c.lookup(ctx, grokIP); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 4 {
+		t.Fatalf("WhoIs calls after success expiry = %d, want 4", calls)
+	}
+}
+
+func TestWhoisCacheDoesNotRememberCanceledLookup(t *testing.T) {
+	var calls int
+	restore := SetWhoIsForTesting(func(ctx context.Context, ip string) (*tsclient.WhoIsResult, error) {
+		calls++
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return &tsclient.WhoIsResult{StableID: grokNode}, nil
+	})
+	t.Cleanup(restore)
+	c := newWhoisCache(time.Now)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.lookup(ctx, grokIP); err == nil {
+		t.Fatal("canceled lookup succeeded")
+	}
+	if res, err := c.lookup(context.Background(), grokIP); err != nil || res.StableID != grokNode {
+		t.Fatalf("lookup after canceled one = %v, %v", res, err)
+	}
+	if calls != 2 {
+		t.Fatalf("WhoIs calls = %d, want 2", calls)
+	}
+}

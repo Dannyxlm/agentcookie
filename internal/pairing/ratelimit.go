@@ -69,10 +69,10 @@ func (l *rateLimiter) allow(ip string) bool {
 	return true
 }
 
-// clientIP extracts the remote IP portion of r.RemoteAddr. Returns the
+// ClientIP extracts the remote IP portion of r.RemoteAddr. Returns the
 // raw RemoteAddr on parse failure so the rate limiter still works
 // against the same key consistently.
-func clientIP(r *http.Request) string {
+func ClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

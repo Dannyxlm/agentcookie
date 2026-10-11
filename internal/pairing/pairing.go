@@ -165,7 +165,7 @@ func NewHandler(cfg HandlerConfig) http.Handler {
 			http.Error(rw, "POST only", http.StatusMethodNotAllowed)
 			return
 		}
-		if !limiter.allow(clientIP(r)) {
+		if !limiter.allow(ClientIP(r)) {
 			http.Error(rw, "too many pairing attempts", http.StatusTooManyRequests)
 			return
 		}
