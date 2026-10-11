@@ -159,6 +159,9 @@ var statusCmd = &cobra.Command{
 				if sink.LastError != "" {
 					fmt.Printf("      last error: %s\n", sink.LastError)
 				}
+				for _, line := range sinkSkipStatusLines(sink, time.Now()) {
+					fmt.Printf("      %s\n", line)
+				}
 			}
 		}
 		if st.SinkState != nil {
@@ -219,4 +222,24 @@ var statusCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// sinkSkipStatusLines explains why the source is not pushing to a sink: the
+// peer was offline on the last attempt, or the sink is inside its backoff
+// window after failures. Without these a skipped sink looks like one that
+// silently stopped syncing.
+func sinkSkipStatusLines(sink state.SinkPushState, now time.Time) []string {
+	var lines []string
+	if sink.Asleep {
+		line := "asleep: Tailscale reported the peer offline"
+		if !sink.LastAsleepAt.IsZero() {
+			line += fmt.Sprintf(" %s ago", now.Sub(sink.LastAsleepAt).Round(time.Second))
+		}
+		lines = append(lines, line+"; pushes skip it until it is back online")
+	}
+	if now.Before(sink.BackoffUntil) {
+		lines = append(lines, fmt.Sprintf("backing off after %d consecutive failure(s); next retry in %s (%s)",
+			sink.ConsecutiveFailures, sink.BackoffUntil.Sub(now).Round(time.Second), sink.BackoffUntil.Local().Format(time.RFC3339)))
+	}
+	return lines
 }

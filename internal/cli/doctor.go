@@ -984,9 +984,16 @@ func checkSourceStateFrom(st *state.SourceState, err error) Check {
 			Remediation: "run `agentcookie source --once` to manually trigger a push",
 		}
 	}
-	if st.TotalFailures > 0 {
-		detail := fmt.Sprintf("last push %s ago, %d total failures", age, st.TotalFailures)
-		if failing := failingSinkLabels(st); failing != "" {
+	// Per-sink records carry over across restarts while the top-level
+	// totals start from zero, so a sink whose last push failed must warn
+	// even when this run has not recorded a failure yet.
+	failing := failingSinkLabels(st)
+	if st.TotalFailures > 0 || failing != "" {
+		detail := fmt.Sprintf("last push %s ago", age)
+		if st.TotalFailures > 0 {
+			detail += fmt.Sprintf(", %d total failures", st.TotalFailures)
+		}
+		if failing != "" {
 			detail += fmt.Sprintf(" (failing sink(s): %s)", failing)
 		}
 		return Check{

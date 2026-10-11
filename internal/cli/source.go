@@ -204,11 +204,7 @@ func runSource(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	statePath := sourceStatePath(cfg.CDPSource.Enabled, common.ConfigDir, home)
 	stateWriter := state.NewWriter(statePath)
-	legacySinkURL := ""
-	if len(sinks) > 0 {
-		legacySinkURL = sinks[0].URL
-	}
-	srcState := newSourceState(statePath, legacySinkURL)
+	srcState := newSourceState(statePath, sinks)
 
 	// --skip-dbsc-suspect is also honored via env var so a LaunchAgent can
 	// opt in without a flag edit.
@@ -308,19 +304,48 @@ func runSource(cmd *cobra.Command, args []string) error {
 // records from the previous run's state file (backoff window, consecutive
 // failures, asleep marker, and history) carry over, so a restart does not
 // reset a failing sink's backoff and hammer it again. A missing or unreadable
-// file starts fresh. Records are matched to sinks by peer (or URL) through
-// SinkFor, the same as during a run.
-func newSourceState(statePath, legacySinkURL string) *state.SourceState {
+// file starts fresh. Only records for currently configured sinks carry over,
+// matched by peer (or URL for a peerless sink) the same way SinkFor matches
+// during a run, so a sink removed from the config drops out of status and
+// doctor on the next start.
+func newSourceState(statePath string, sinks []config.SinkTarget) *state.SourceState {
+	legacySinkURL := ""
+	if len(sinks) > 0 {
+		legacySinkURL = sinks[0].URL
+	}
 	st := &state.SourceState{Role: "source", SinkURL: legacySinkURL}
 	prev, err := state.LoadSource(statePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agentcookie source: ignoring unreadable %s (%v); starting with fresh per-sink state\n", statePath, err)
 		return st
 	}
-	if prev != nil {
-		st.Sinks = append([]state.SinkPushState(nil), prev.Sinks...)
+	if prev == nil {
+		return st
+	}
+	for _, rec := range prev.Sinks {
+		if sinkConfigured(sinks, rec) {
+			st.Sinks = append(st.Sinks, rec)
+		}
 	}
 	return st
+}
+
+// sinkConfigured reports whether a saved per-sink record belongs to one of
+// the configured sinks, using SinkFor's identity: peer when the record has
+// one, otherwise URL among peerless sinks.
+func sinkConfigured(sinks []config.SinkTarget, rec state.SinkPushState) bool {
+	for _, s := range sinks {
+		if rec.Peer != "" {
+			if s.Peer == rec.Peer {
+				return true
+			}
+			continue
+		}
+		if s.Peer == "" && s.URL == rec.URL {
+			return true
+		}
+	}
+	return false
 }
 
 func sourceStatePath(cdpSource bool, configDir, home string) string {

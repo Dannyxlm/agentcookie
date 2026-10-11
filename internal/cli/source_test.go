@@ -1041,7 +1041,7 @@ func TestNewSourceStateLoadsOldFileWithoutBackoffFields(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "source-state.json")
 	writeCLIFile(t, statePath, `{"role":"source","sink_url":"http://a.test/sync","sinks":[{"peer":"grok-bot","url":"http://a.test/sync","total_pushes":7,"total_failures":2}]}`)
 
-	st := newSourceState(statePath, "http://a.test/sync")
+	st := newSourceState(statePath, []config.SinkTarget{{URL: "http://a.test/sync", Peer: "grok-bot"}})
 	if len(st.Sinks) != 1 {
 		t.Fatalf("expected 1 carried-over record, got %+v", st.Sinks)
 	}
@@ -1053,8 +1053,35 @@ func TestNewSourceStateLoadsOldFileWithoutBackoffFields(t *testing.T) {
 		t.Fatalf("missing new fields should decode as zero values, got %+v", ps)
 	}
 
-	if missing := newSourceState(filepath.Join(t.TempDir(), "absent.json"), ""); len(missing.Sinks) != 0 || missing.Role != "source" {
+	if missing := newSourceState(filepath.Join(t.TempDir(), "absent.json"), nil); len(missing.Sinks) != 0 || missing.Role != "source" {
 		t.Fatalf("missing file should start fresh, got %+v", missing)
+	}
+}
+
+func TestNewSourceStateDropsRemovedSinks(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "source-state.json")
+	writeCLIFile(t, statePath, `{"role":"source","sinks":[
+		{"peer":"kept","url":"http://old-url.test/sync","total_pushes":3},
+		{"peer":"retired","url":"http://retired.test/sync","total_failures":4,"last_error":"refused"},
+		{"url":"http://peerless.test/sync","total_pushes":2},
+		{"url":"http://gone-peerless.test/sync","total_pushes":1}
+	]}`)
+
+	st := newSourceState(statePath, []config.SinkTarget{
+		{URL: "http://new-url.test/sync", Peer: "kept"},
+		{URL: "http://peerless.test/sync"},
+	})
+	if st.SinkURL != "http://new-url.test/sync" {
+		t.Fatalf("legacy SinkURL should be the first configured sink, got %q", st.SinkURL)
+	}
+	if len(st.Sinks) != 2 {
+		t.Fatalf("only configured sinks should carry over, got %+v", st.Sinks)
+	}
+	if st.Sinks[0].Peer != "kept" || st.Sinks[0].TotalPushes != 3 {
+		t.Fatalf("peer-keyed record should survive a URL change, got %+v", st.Sinks[0])
+	}
+	if st.Sinks[1].URL != "http://peerless.test/sync" || st.Sinks[1].TotalPushes != 2 {
+		t.Fatalf("peerless record should match by URL, got %+v", st.Sinks[1])
 	}
 }
 
