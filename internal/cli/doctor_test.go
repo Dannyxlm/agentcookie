@@ -341,6 +341,23 @@ func TestCheckSourceState(t *testing.T) {
 			t.Errorf("detail should name the failing sink, got %q", c.Detail)
 		}
 	})
+	t.Run("carried-over per-sink failure warns with zero run totals", func(t *testing.T) {
+		st := &state.SourceState{
+			LastPush:    time.Now(),
+			TotalPushes: 1,
+			Sinks: []state.SinkPushState{
+				{Peer: "alpha", URL: "http://a.test/sync", TotalPushes: 1},
+				{Peer: "bravo", URL: "http://b.test/sync", TotalFailures: 2, ConsecutiveFailures: 2, LastError: "connection refused", BackoffUntil: time.Now().Add(time.Minute)},
+			},
+		}
+		c := checkSourceStateFrom(st, nil)
+		if c.Severity != SeverityWarn {
+			t.Fatalf("got %q (%q)", c.Severity, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "bravo") || strings.Contains(c.Detail, "total failures") {
+			t.Errorf("detail should name the failing sink without a zero total, got %q", c.Detail)
+		}
+	})
 	t.Run("healthy multi-sink notes sink count", func(t *testing.T) {
 		st := &state.SourceState{
 			LastPush: time.Now(),

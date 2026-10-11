@@ -54,6 +54,18 @@ type SinkPushState struct {
 	TotalFailures int       `json:"total_failures"`
 	LastError     string    `json:"last_error,omitempty"`
 	LastErrorAt   time.Time `json:"last_error_at,omitempty"`
+
+	// ConsecutiveFailures counts failed pushes since the last success.
+	// BackoffUntil is when the source next tries this sink; pushes before
+	// then skip it. Both reset on a successful push.
+	ConsecutiveFailures int       `json:"consecutive_failures,omitempty"`
+	BackoffUntil        time.Time `json:"backoff_until,omitempty"`
+
+	// Asleep is true when Tailscale reported the sink's peer offline on the
+	// most recent attempt, so the source skipped it without dialing. It is
+	// not a failure. LastAsleepAt is when that was last seen.
+	Asleep       bool      `json:"asleep,omitempty"`
+	LastAsleepAt time.Time `json:"last_asleep_at,omitempty"`
 }
 
 // SinkFor returns the per-sink record for a peer (or URL when the sink has
