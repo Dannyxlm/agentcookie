@@ -39,6 +39,12 @@ type SourceState struct {
 	// written before multi-sink, in which case the top-level fields and the
 	// legacy SinkURL are the whole story.
 	Sinks []SinkPushState `json:"sinks,omitempty"`
+
+	// PullListener is "up" while source --watch serves GET /pull (and
+	// /pair) and "down" while it waits for a tailnet address. Empty when
+	// no listener has been started (source --once, or an older binary).
+	PullListener     string `json:"pull_listener,omitempty"`
+	PullListenerAddr string `json:"pull_listener_addr,omitempty"`
 }
 
 // SinkPushState is one fan-out sink's push record, keyed by peer hostname

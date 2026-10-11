@@ -153,6 +153,11 @@ func runSource(cmd *cobra.Command, args []string) error {
 	// opt in without a flag edit.
 	skipDBSC := sourceSkipDBSC || os.Getenv("AGENTCOOKIE_SKIP_DBSC_SUSPECT") == "1"
 
+	// Teammate mode: load teammates.yaml (absent = off, no behavior
+	// change) and migrate any listed legacy push peer before the first
+	// push, in --once too. --watch also hot-reloads edits.
+	activeTeammates = startTeammates(cmd.Context(), common.ConfigDir, home, cfg, sourceWatch)
+
 	push := func(ctx context.Context) (int, error) {
 		return pushWithFreshBlocklist(ctx, cfg, key, sourceDryRun, sourceVerbose, skipDBSC, srcState, stateWriter)
 	}
@@ -177,7 +182,9 @@ func runSource(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := startWatchPullListener(cmd.Context(), cfg); err != nil {
+	if err := startWatchPullListener(cmd.Context(), cfg, func(up bool, addr string) {
+		recordPullListenerState(srcState, stateWriter, up, addr)
+	}); err != nil {
 		return err
 	}
 
@@ -349,6 +356,29 @@ func aggregateSinkResults(results []sinkResult) (posted int, sinkErrs []error) {
 	return posted, sinkErrs
 }
 
+// sourceStateMu guards srcState, which push cycles and the pull listener
+// supervisor both update.
+var sourceStateMu sync.Mutex
+
+// recordPullListenerState records whether GET /pull is being served
+// (pull_listener: up|down) in source state.
+func recordPullListenerState(srcState *state.SourceState, stateWriter *state.Writer, up bool, addr string) {
+	if srcState == nil {
+		return
+	}
+	sourceStateMu.Lock()
+	defer sourceStateMu.Unlock()
+	srcState.PullListener = "down"
+	srcState.PullListenerAddr = ""
+	if up {
+		srcState.PullListener = "up"
+		srcState.PullListenerAddr = addr
+	}
+	if stateWriter != nil {
+		_ = stateWriter.Save(srcState)
+	}
+}
+
 func recordSourcePushResult(
 	srcState *state.SourceState,
 	stateWriter *state.Writer,
@@ -359,6 +389,8 @@ func recordSourcePushResult(
 	if srcState == nil {
 		return
 	}
+	sourceStateMu.Lock()
+	defer sourceStateMu.Unlock()
 	now := time.Now().UTC()
 	// A read/envelope-phase failure (err != nil) is recorded once at the
 	// top level; no per-sink attempt happened.
@@ -606,6 +638,12 @@ func pushOnce(
 	sinkReports := make([]map[string]any, 0, len(sinks))
 	var humanLines []string
 	for _, sink := range sinks {
+		// A legacy push peer migrated to teammate mode is never dialed
+		// again (it pulls instead). It is skipped silently, not recorded
+		// as a failure, and source.yaml is left untouched.
+		if activeTeammates.SuppressPush(sink.Peer) {
+			continue
+		}
 		r := sinkResult{Peer: sink.Peer, URL: sink.URL}
 		secret, secErr := resolveSinkSecret(common.ConfigDir, sink, cfg.Security.SharedSecret)
 		if secErr != nil {

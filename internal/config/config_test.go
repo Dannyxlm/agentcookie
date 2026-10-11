@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -960,5 +962,66 @@ func TestExampleMultiSinkConfigDecodes(t *testing.T) {
 	}
 	if got := len(cfg.ResolvedSinks()); got != 2 {
 		t.Fatalf("example should declare 2 sinks, got %d", got)
+	}
+}
+
+// Covers R1 (teammates): a source.yaml with no push sink loads when
+// teammates.yaml lists at least one teammate, and fails with neither.
+func TestLoadSourceAllowsZeroSinksWithTeammates(t *testing.T) {
+	noSink := `
+chrome:
+  db_path: /tmp/Cookies
+`
+	t.Run("neither", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("source.yaml with no sink and no teammates should fail")
+		}
+	})
+	t.Run("empty teammates list", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates: []\n")
+		if _, err := LoadSource(dir); err == nil {
+			t.Fatal("an empty teammates list should not stand in for a sink")
+		}
+	})
+	t.Run("one teammate", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates:\n  - name: grokbot\n")
+		cfg, err := LoadSource(dir)
+		if err != nil {
+			t.Fatalf("LoadSource with a teammate and no sink: %v", err)
+		}
+		if len(cfg.ResolvedSinks()) != 0 {
+			t.Fatalf("want zero push sinks, got %v", cfg.ResolvedSinks())
+		}
+	})
+	t.Run("broken teammates file", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "source.yaml", noSink)
+		writeFile(t, dir, TeammatesFile, "teammates:\n  - name: [\n")
+		if _, err := LoadSource(dir); err == nil || !strings.Contains(err.Error(), TeammatesFile) {
+			t.Fatalf("a broken teammates.yaml with no sink should fail naming the file, got %v", err)
+		}
+	})
+}
+
+// Covers R12: teammate mode adds no keys to source.yaml, so an older binary
+// (strict KnownFields decoding of this same struct) still loads it. Pinning
+// the YAML key set makes any new source.yaml key fail here first.
+func TestSourceConfigYAMLKeysUnchangedForOlderBinaries(t *testing.T) {
+	want := []string{"browser", "cdp_source", "chrome", "cmux", "peer", "security", "sink", "sinks"}
+	var got []string
+	for f := range reflect.TypeFor[SourceConfig]().Fields() {
+		tag := f.Tag.Get("yaml")
+		name, _, _ := strings.Cut(tag, ",")
+		got = append(got, name)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("source.yaml keys = %v, want %v (teammate mode must not add source.yaml keys)", got, want)
 	}
 }

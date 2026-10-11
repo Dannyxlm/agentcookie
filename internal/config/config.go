@@ -217,7 +217,17 @@ func LoadSource(dir string) (*SourceConfig, error) {
 	}
 	sinks := cfg.ResolvedSinks()
 	if len(sinks) == 0 {
-		return nil, fmt.Errorf("%s: at least one sink is required (set sink.url, or a sinks: list)", path)
+		// Teammate mode delivers by pull only, so a source with listed
+		// teammates needs no push sink. teammates.yaml is consulted only
+		// here; source.yaml itself gains no keys (older binaries still
+		// load it with strict decoding).
+		tm, tmErr := LoadTeammates(dir)
+		if tmErr != nil {
+			return nil, fmt.Errorf("%s: no sink configured and %s did not load: %w", path, TeammatesFile, tmErr)
+		}
+		if tm == nil || len(tm.Teammates) == 0 {
+			return nil, fmt.Errorf("%s: at least one sink is required (set sink.url, or a sinks: list, or list teammates in %s)", path, TeammatesFile)
+		}
 	}
 	for i, s := range sinks {
 		if s.URL == "" {

@@ -1,0 +1,31 @@
+# Example teammates.yaml. Copy to ~/.config/agentcookie/teammates.yaml on
+# the laptop that runs `agentcookie source --watch`.
+#
+# Each entry is a Tincan agent name. Listed agents pull your cookies from
+# this laptop over Tailscale; the laptop never dials them. The daemon
+# reloads this file when you save it. If an edit does not parse, every
+# teammate pull and pairing is paused until the file loads again.
+#
+# agentcookie never writes this file. Binding state (approved node,
+# pairing and pull history) lives in ~/.agentcookie/teammates-state.json.
+
+teammates:
+  # Always-on VM agent: pulls at the start of each turn and on a
+  # 5 to 15 minute timer.
+  - name: grokbot
+    cadence: turn+timer
+
+  # Sandbox that sleeps between turns: pulls at the start of each turn.
+  - name: instinct
+    cadence: turn
+
+  # cadence may be left out; it then defaults by the agent's Tincan kind.
+  - name: dot
+
+# Virtual Tincan agents (chatgpt, sesame, and *-web agents) have no
+# Tailscale node and are rejected.
+
+# Optional: the tincan CLI and the TINCAN_CONFIG of the laptop's dedicated
+# `agentcookie` Tincan agent.
+# tincan_path: ~/.local/bin/tincan
+# tincan_config: ~/.config/agentcookie/tincan/client.json

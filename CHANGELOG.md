@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Teammates: listed agents pull cookies from the laptop (groundwork)
+
+- New owner file `~/.config/agentcookie/teammates.yaml` lists Tincan agent names (with an optional `cadence` of `turn` or `turn+timer`, plus optional `tincan_path` and `tincan_config`). Decoding is strict: unknown keys, duplicate names, and virtual Tincan agents (chatgpt, sesame, and `*-web` agents, which never have a Tailscale node) are rejected with a message saying why. See `examples/teammates.yaml`.
+- `source --watch` reloads `teammates.yaml` when it changes, with no restart. If an edit does not parse, every teammate pull and pairing is paused until the file loads again, and the error is kept in `~/.agentcookie/teammates-state.json`.
+- The daemon keeps teammate binding state (approved Tailscale node, pairing and pull history, `last_pulled_at`, `last_pull_error`) in `~/.agentcookie/teammates-state.json`, written atomically. It never writes `teammates.yaml` or `source.yaml`, and `source.yaml` gains no keys, so older binaries still load it.
+- `source.yaml` may now have no push sink when `teammates.yaml` lists at least one teammate.
+- A legacy push sink whose peer name is listed as a teammate is no longer dialed. Its key is kept, a one-time log line suggests deleting its entry from `source.yaml`, and push to it stays off even if the name is later removed from `teammates.yaml`.
+- `GET /pull` authorizes per teammate: a teammate's key is served only while the name is listed and the request comes from the Tailscale node approved for it (checked with `tailscale whois`, cached per IP for 5 minutes; a WhoIs failure refuses). A request with a teammate's key from any other node is refused and logged as a security event. A removed teammate's key is refused and never falls back to the non-teammate rules. The legacy shared secret is refused on `/pull` while teammates are configured. Paired peers that are not teammates pull exactly as before.
+- A keyless or failed-HMAC `/pull` from a paired teammate's approved node answers 401 and is reported internally as a lost key, for the automatic re-pair that a later release adds.
+- The `/pull` listener no longer stays off for the life of the daemon when Tailscale is late at boot. It retries until a tailnet address exists, rebinds when that address changes, and records `pull_listener: up|down` in `source-state.json`.
+- `POST /pair` is served on the same 9998 server while a teammate pairing is pending (404 otherwise). Codes are minted per teammate, single-use, valid for 30 minutes, accepted only from that teammate's approved node, and keep the existing attempt limit and 16 KB body cap (413 when exceeded). The key is stored as `keys/<teammate>.json`. The wire format is unchanged, so `pair --as sink` works against it. An oversized body on `pair --as source` now answers 413 instead of 400.
+- Nothing changes for a configuration without `teammates.yaml`.
+
 ### Keychain: --recreate keeps existing Chrome cookies readable
 
 - `agentcookie wizard set-keychain-access --recreate` deleted Chrome Safe Storage and re-added it with a random value, so every existing Chrome cookie on that Mac became unreadable. The same step also ran after `--any-app`'s guard refused to touch an unreadable item, which bypassed that guard. The step now recreates an existing item with its own value, refuses to delete an item whose value it cannot read, and uses a fresh value only when no item exists yet.

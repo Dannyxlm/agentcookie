@@ -128,25 +128,39 @@ func DeriveKey(sharedSecret []byte, code Code) ([]byte, string, error) {
 	return key, fp, nil
 }
 
-// RunSource starts the source-side listener, prints the code, waits for the
-// sink to connect. Returns the derived key + peer info on success.
-func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Writer) (*HandshakeResult, Code, error) {
-	curve := ecdh.X25519()
-	priv, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, "", fmt.Errorf("gen ephemeral key: %w", err)
-	}
-	code, err := NewCode()
-	if err != nil {
-		return nil, "", err
-	}
+// PairError is a /pair refusal with the HTTP status to answer with.
+type PairError struct {
+	Status int
+	Msg    string
+}
 
-	resultCh := make(chan *HandshakeResult, 1)
-	errCh := make(chan error, 1)
+func (e *PairError) Error() string { return e.Msg }
+
+// HandlerConfig configures NewHandler. Serving is separate from code
+// minting: the caller decides which presented code is valid and which peer
+// name the key is filed under.
+type HandlerConfig struct {
+	// LocalHostname is announced to the sink in SourceResponse.
+	LocalHostname string
+	// Authorize checks the presented code (and anything else about the
+	// caller) and returns the code the key is derived with plus the peer
+	// name. Return a *PairError to refuse with its status; any other
+	// error answers 401.
+	Authorize func(r *http.Request, req *SinkRequest) (Code, string, error)
+	// Complete runs after a successful exchange and before the response
+	// is written, so a key that cannot be stored never reads as paired on
+	// the sink. A *PairError answers with its status; other errors 500.
+	Complete func(peer string, code Code, res *HandshakeResult) error
+}
+
+// NewHandler serves the source side of POST /pair: the per-IP attempt
+// limiter, the 16 KB body cap (413 when exceeded), protocol version check,
+// X25519 exchange with a fresh ephemeral key, and HKDF derivation. The wire
+// format is the one RunSink speaks.
+func NewHandler(cfg HandlerConfig) http.Handler {
 	limiter := newRateLimiter()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/pair", func(rw http.ResponseWriter, r *http.Request) {
+	curve := ecdh.X25519()
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(rw, "POST only", http.StatusMethodNotAllowed)
 			return
@@ -158,6 +172,10 @@ func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Write
 		httpserver.LimitedReader(r, httpserver.Defaults(httpserver.Pair).MaxBodyBytes)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			if _, tooBig := errors.AsType[*http.MaxBytesError](err); tooBig {
+				http.Error(rw, "pairing request too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(rw, "read body: "+err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -170,13 +188,19 @@ func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Write
 			http.Error(rw, fmt.Sprintf("protocol mismatch: sink=%d source=%d", req.ProtocolVersion, ProtocolVersion), http.StatusBadRequest)
 			return
 		}
-		if !Code(req.Code).Equal(code) {
-			http.Error(rw, "invalid pairing code", http.StatusUnauthorized)
+		code, peer, err := cfg.Authorize(r, &req)
+		if err != nil {
+			writePairError(rw, err, http.StatusUnauthorized)
 			return
 		}
 		sinkPub, err := curve.NewPublicKey(req.SinkPublicKey)
 		if err != nil {
 			http.Error(rw, "bad sink public key: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		priv, err := curve.GenerateKey(rand.Reader)
+		if err != nil {
+			http.Error(rw, "gen ephemeral key: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		shared, err := priv.ECDH(sinkPub)
@@ -189,23 +213,64 @@ func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Write
 			http.Error(rw, "derive: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		resp := SourceResponse{
-			ProtocolVersion: ProtocolVersion,
-			SourcePublicKey: priv.PublicKey().Bytes(),
-			SourceHostname:  localHostname,
-			Fingerprint:     fp,
-		}
-		respBody, _ := json.Marshal(resp)
-		rw.Header().Set("Content-Type", "application/json")
-		_, _ = rw.Write(respBody)
-		resultCh <- &HandshakeResult{
+		res := &HandshakeResult{
 			Key:         key,
 			Fingerprint: fp,
 			LocalRole:   "source",
 			RemotePeer:  req.SinkHostname,
 			PairedAt:    time.Now(),
 		}
+		if err := cfg.Complete(peer, code, res); err != nil {
+			writePairError(rw, err, http.StatusInternalServerError)
+			return
+		}
+		respBody, _ := json.Marshal(SourceResponse{
+			ProtocolVersion: ProtocolVersion,
+			SourcePublicKey: priv.PublicKey().Bytes(),
+			SourceHostname:  cfg.LocalHostname,
+			Fingerprint:     fp,
+		})
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = rw.Write(respBody)
 	})
+}
+
+func writePairError(rw http.ResponseWriter, err error, fallback int) {
+	if pe, ok := errors.AsType[*PairError](err); ok {
+		http.Error(rw, pe.Msg, pe.Status)
+		return
+	}
+	http.Error(rw, err.Error(), fallback)
+}
+
+// RunSource starts the source-side listener, prints the code, waits for the
+// sink to connect. Returns the derived key + peer info on success.
+func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Writer) (*HandshakeResult, Code, error) {
+	code, err := NewCode()
+	if err != nil {
+		return nil, "", err
+	}
+
+	resultCh := make(chan *HandshakeResult, 1)
+	errCh := make(chan error, 1)
+
+	mux := http.NewServeMux()
+	mux.Handle("/pair", NewHandler(HandlerConfig{
+		LocalHostname: localHostname,
+		Authorize: func(r *http.Request, req *SinkRequest) (Code, string, error) {
+			if !Code(req.Code).Equal(code) {
+				return "", "", &PairError{Status: http.StatusUnauthorized, Msg: "invalid pairing code"}
+			}
+			return code, req.SinkHostname, nil
+		},
+		Complete: func(_ string, _ Code, res *HandshakeResult) error {
+			select {
+			case resultCh <- res:
+			default:
+			}
+			return nil
+		},
+	}))
 
 	srv := httpserver.Configure(&http.Server{Addr: listenAddr, Handler: mux}, httpserver.Pair)
 	ln, err := net.Listen("tcp", listenAddr)
