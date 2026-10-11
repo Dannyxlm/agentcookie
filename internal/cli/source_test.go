@@ -19,6 +19,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/spf13/cobra"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 	"github.com/mvanhorn/agentcookie/internal/config"
@@ -368,6 +369,11 @@ func newSourcePushFixture(t *testing.T, cookies []chrome.Cookie) *sourcePushFixt
 	oldTransport := http.DefaultTransport
 	http.DefaultTransport = capture
 	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	// Never shell out to the real Tailscale CLI: status is unavailable
+	// unless a test installs its own stub.
+	t.Cleanup(tsclient.SetStatusForTesting(func(context.Context) (*tsclient.Status, error) {
+		return nil, errors.New("tailscale status unavailable in tests")
+	}))
 
 	cfg := &config.SourceConfig{
 		Sink:     config.SinkRef{URL: "http://agentcookie-sink.test/sync"},
@@ -921,5 +927,196 @@ func TestPushTriggerRateCapCollapsesBursts(t *testing.T) {
 	trigger.fire(context.Background())
 	if pushes != 2 {
 		t.Fatalf("trigger after the cap should push, got %d", pushes)
+	}
+}
+
+// --- Backoff survives restarts ---
+
+// passthroughResolver keeps the sink URL as-is so no test reaches Tailscale.
+func passthroughResolver(t *testing.T) {
+	t.Helper()
+	t.Cleanup(SetResolveSinkURLForTesting(func(_ context.Context, rawURL string) (string, error) {
+		return rawURL, nil
+	}))
+}
+
+// runSourceOnceCDP runs `agentcookie source --once` end to end against a CDP
+// source config in fx.configDir, so the run never touches the Keychain.
+func runSourceOnceCDP(t *testing.T, fx *sourcePushFixture, sinkURLs ...string) error {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("cdp_source:\n  enabled: true\n  endpoint: \"http://127.0.0.1:9230\"\n")
+	b.WriteString("security:\n  shared_secret: \"" + fx.secret + "\"\n")
+	b.WriteString("sinks:\n")
+	for _, u := range sinkURLs {
+		b.WriteString("  - url: \"" + u + "\"\n")
+	}
+	writeCLIFile(t, filepath.Join(fx.configDir, "source.yaml"), b.String())
+
+	previous := readCDPSource
+	readCDPSource = func(context.Context, string) ([]chrome.Cookie, error) {
+		return []chrome.Cookie{{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"}}, nil
+	}
+	t.Cleanup(func() { readCDPSource = previous })
+
+	prevOnce, prevWatch := sourceOnce, sourceWatch
+	sourceOnce, sourceWatch = true, false
+	t.Cleanup(func() { sourceOnce, sourceWatch = prevOnce, prevWatch })
+
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	return runSource(cmd, nil)
+}
+
+func TestSourceOnceHonorsBackoffFromPreviousRun(t *testing.T) {
+	fx := newSourcePushFixture(t, nil)
+	fx.secret = "source-once-restart-test-secret-0123456789"
+	fx.capture.secret = fx.secret
+	passthroughResolver(t)
+	now := stubSourceClock(t, time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC))
+
+	urlBacked := "http://sink-backed-off.test/sync"
+	urlFresh := "http://sink-fresh.test/sync"
+	statePath := sourceStatePath(true, fx.configDir, "")
+	until := now.Add(10 * time.Minute)
+	prev := &state.SourceState{
+		Role: "source",
+		Sinks: []state.SinkPushState{{
+			URL:                 urlBacked,
+			TotalFailures:       4,
+			ConsecutiveFailures: 4,
+			BackoffUntil:        until,
+			LastError:           "sink returned 500",
+		}},
+	}
+	if err := state.NewWriter(statePath).Save(prev); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	if err := runSourceOnceCDP(t, fx, urlBacked, urlFresh); err != nil {
+		t.Fatalf("source --once: %v", err)
+	}
+	if n := fx.capture.attemptsTo(urlBacked); n != 0 {
+		t.Fatalf("sink inside a persisted backoff window was dialed %d times", n)
+	}
+	if n := fx.capture.attemptsTo(urlFresh); n != 1 {
+		t.Fatalf("fresh sink should get 1 POST, got %d", n)
+	}
+	saved, err := state.LoadSource(statePath)
+	if err != nil || saved == nil {
+		t.Fatalf("reload state: %v", err)
+	}
+	ps := sinkStateFor(saved, urlBacked)
+	if ps == nil || ps.ConsecutiveFailures != 4 || ps.TotalFailures != 4 || !ps.BackoffUntil.Equal(until) {
+		t.Fatalf("backed-off sink record should carry over unchanged, got %+v", ps)
+	}
+}
+
+func TestSourceOnceCorruptStateFileStartsFresh(t *testing.T) {
+	fx := newSourcePushFixture(t, nil)
+	fx.secret = "source-once-restart-test-secret-0123456789"
+	fx.capture.secret = fx.secret
+	passthroughResolver(t)
+
+	urlSink := "http://sink-a.test/sync"
+	statePath := sourceStatePath(true, fx.configDir, "")
+	writeCLIFile(t, statePath, "{not json")
+
+	if err := runSourceOnceCDP(t, fx, urlSink); err != nil {
+		t.Fatalf("source --once with a corrupt state file: %v", err)
+	}
+	if n := fx.capture.attemptsTo(urlSink); n != 1 {
+		t.Fatalf("sink should be dialed once, got %d", n)
+	}
+	saved, err := state.LoadSource(statePath)
+	if err != nil || saved == nil {
+		t.Fatalf("state file should be rewritten cleanly: %v", err)
+	}
+	if ps := sinkStateFor(saved, urlSink); ps == nil || ps.TotalPushes != 1 || ps.ConsecutiveFailures != 0 {
+		t.Fatalf("fresh per-sink record expected, got %+v", ps)
+	}
+}
+
+func TestNewSourceStateLoadsOldFileWithoutBackoffFields(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "source-state.json")
+	writeCLIFile(t, statePath, `{"role":"source","sink_url":"http://a.test/sync","sinks":[{"peer":"grok-bot","url":"http://a.test/sync","total_pushes":7,"total_failures":2}]}`)
+
+	st := newSourceState(statePath, "http://a.test/sync")
+	if len(st.Sinks) != 1 {
+		t.Fatalf("expected 1 carried-over record, got %+v", st.Sinks)
+	}
+	ps := st.Sinks[0]
+	if ps.Peer != "grok-bot" || ps.TotalPushes != 7 || ps.TotalFailures != 2 {
+		t.Fatalf("history should carry over, got %+v", ps)
+	}
+	if ps.ConsecutiveFailures != 0 || !ps.BackoffUntil.IsZero() || ps.Asleep || !ps.LastAsleepAt.IsZero() {
+		t.Fatalf("missing new fields should decode as zero values, got %+v", ps)
+	}
+
+	if missing := newSourceState(filepath.Join(t.TempDir(), "absent.json"), ""); len(missing.Sinks) != 0 || missing.Role != "source" {
+		t.Fatalf("missing file should start fresh, got %+v", missing)
+	}
+}
+
+// --- Literal Tailscale IP sinks ---
+
+func TestSourcePushOfflineTailnetIPSinkIsSkippedAsAsleep(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlAsleep := "http://100.101.102.103:9999/sync"
+	urlAwake := "http://100.87.49.2:9999/sync"
+	urlV6Asleep := "http://[fd7a:115c:a1e0::1234]:9999/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlAsleep}, {URL: urlAwake}, {URL: urlV6Asleep}}
+	passthroughResolver(t)
+	calls := 0
+	t.Cleanup(tsclient.SetStatusForTesting(func(context.Context) (*tsclient.Status, error) {
+		calls++
+		return &tsclient.Status{Peer: map[string]*tsclient.PeerStatus{
+			"a": {HostName: "instinct", TailscaleIPs: []string{"100.101.102.103"}, Online: false},
+			"b": {HostName: "grok-bot", TailscaleIPs: []string{"100.87.49.2"}, Online: true},
+			"c": {HostName: "sandbox", TailscaleIPs: []string{"100.90.1.1", "fd7a:115c:a1e0::1234"}, Online: false},
+		}}, nil
+	}))
+
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("an offline peer is not a push failure, got: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("Tailscale status should be fetched once per push, got %d", calls)
+	}
+	for _, u := range []string{urlAsleep, urlV6Asleep} {
+		if n := fx.capture.attemptsTo(u); n != 0 {
+			t.Fatalf("offline IP peer %s must not be dialed, got %d POSTs", u, n)
+		}
+		ps := sinkStateFor(fx.srcState, u)
+		if ps == nil || !ps.Asleep || ps.LastAsleepAt.IsZero() || ps.TotalFailures != 0 || !ps.BackoffUntil.IsZero() {
+			t.Fatalf("offline IP peer %s should be recorded asleep, not failed, got %+v", u, ps)
+		}
+	}
+	if n := fx.capture.attemptsTo(urlAwake); n != 1 {
+		t.Fatalf("online IP peer should get 1 POST, got %d", n)
+	}
+}
+
+func TestSourcePushTailnetIPSinkDialsWhenStatusUnavailable(t *testing.T) {
+	fx := newSourcePushFixture(t, []chrome.Cookie{
+		{HostKey: ".example.com", Name: "s", Value: "v", Path: "/"},
+	})
+	urlSink := "http://100.101.102.103:9999/sync"
+	fx.cfg.Sink = config.SinkRef{}
+	fx.cfg.Sinks = []config.SinkTarget{{URL: urlSink}}
+	passthroughResolver(t)
+	// The fixture's status stub already reports Tailscale unavailable.
+
+	if _, err := fx.push(); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if n := fx.capture.attemptsTo(urlSink); n != 1 {
+		t.Fatalf("status unavailable should still dial the IP sink once, got %d", n)
+	}
+	if ps := sinkStateFor(fx.srcState, urlSink); ps == nil || ps.Asleep || ps.TotalPushes != 1 {
+		t.Fatalf("expected a normal push record, got %+v", ps)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -201,12 +202,13 @@ func runSource(cmd *cobra.Command, args []string) error {
 
 	// State writer for `agentcookie status` to read.
 	home, _ := os.UserHomeDir()
-	stateWriter := state.NewWriter(sourceStatePath(cfg.CDPSource.Enabled, common.ConfigDir, home))
+	statePath := sourceStatePath(cfg.CDPSource.Enabled, common.ConfigDir, home)
+	stateWriter := state.NewWriter(statePath)
 	legacySinkURL := ""
 	if len(sinks) > 0 {
 		legacySinkURL = sinks[0].URL
 	}
-	srcState := &state.SourceState{Role: "source", SinkURL: legacySinkURL}
+	srcState := newSourceState(statePath, legacySinkURL)
 
 	// --skip-dbsc-suspect is also honored via env var so a LaunchAgent can
 	// opt in without a flag edit.
@@ -300,6 +302,25 @@ func runSource(cmd *cobra.Command, args []string) error {
 	}()
 
 	return w.Run(cmd.Context())
+}
+
+// newSourceState builds the in-memory SourceState for a source run. Per-sink
+// records from the previous run's state file (backoff window, consecutive
+// failures, asleep marker, and history) carry over, so a restart does not
+// reset a failing sink's backoff and hammer it again. A missing or unreadable
+// file starts fresh. Records are matched to sinks by peer (or URL) through
+// SinkFor, the same as during a run.
+func newSourceState(statePath, legacySinkURL string) *state.SourceState {
+	st := &state.SourceState{Role: "source", SinkURL: legacySinkURL}
+	prev, err := state.LoadSource(statePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentcookie source: ignoring unreadable %s (%v); starting with fresh per-sink state\n", statePath, err)
+		return st
+	}
+	if prev != nil {
+		st.Sinks = append([]state.SinkPushState(nil), prev.Sinks...)
+	}
+	return st
 }
 
 func sourceStatePath(cdpSource bool, configDir, home string) string {
@@ -685,6 +706,7 @@ func pushOnce(
 	now := sourceNow()
 	results := make([]sinkResult, len(sinks))
 	replies := make([]string, len(sinks))
+	tailnetIPOffline := newTailnetIPOfflineCheck(ctx)
 	var wg sync.WaitGroup
 	for i, sink := range sinks {
 		results[i] = sinkResult{Peer: sink.Peer, URL: sink.URL}
@@ -693,6 +715,10 @@ func pushOnce(
 				results[i].SkippedUntil = until
 				continue
 			}
+		}
+		if tailnetIPOffline(sink.URL) {
+			results[i].Asleep = true
+			continue
 		}
 		wg.Add(1)
 		go func(r *sinkResult, reply *string, sink config.SinkTarget) {
@@ -759,6 +785,34 @@ func aggregateFailedLabels(results []sinkResult) []string {
 		}
 	}
 	return failed
+}
+
+// newTailnetIPOfflineCheck returns a predicate reporting whether a sink URL
+// whose host is a literal Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48)
+// belongs to a peer Tailscale status reports offline. Such a sink is treated
+// like tsclient.ErrPeerOffline: skipped as asleep without a dial. Status is
+// fetched at most once per push, and only when a literal Tailscale IP sink is
+// checked. When status is unavailable or no peer carries the IP, the
+// predicate reports false and the sink is dialed as before.
+func newTailnetIPOfflineCheck(ctx context.Context) func(rawURL string) bool {
+	var (
+		st     *tsclient.Status
+		loaded bool
+	)
+	return func(rawURL string) bool {
+		u, err := url.Parse(rawURL)
+		if err != nil || !tsclient.IsTailscaleIP(u.Hostname()) {
+			return false
+		}
+		if !loaded {
+			loaded = true
+			if got, err := tsclient.CurrentStatus(ctx); err == nil {
+				st = got
+			}
+		}
+		peer := st.PeerByIP(u.Hostname())
+		return peer != nil && !peer.Online
+	}
 }
 
 // resolveSinkSecret resolves the transport secret for a single sink. A sink

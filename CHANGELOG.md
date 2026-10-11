@@ -4,8 +4,8 @@
 
 ### Push sinks back off instead of failing in a loop
 
-- A push sink whose Tailscale peer is offline (a paused sandbox, a sleeping machine) is now skipped without being dialed. `source-state.json` marks it asleep and its failure count does not change.
-- A sink that keeps failing is retried on an exponential backoff, starting at 30 seconds and capped at 30 minutes. The backoff resets on the next successful push. Pushes inside the window skip that sink and still deliver to the others.
+- A push sink whose Tailscale peer is offline (a paused sandbox, a sleeping machine) is now skipped without being dialed. `source-state.json` marks it asleep and its failure count does not change. This also covers a sink URL that names a Tailscale IP directly (100.64.0.0/10 or fd7a:115c:a1e0::/48): the source checks the IP against `tailscale status` once per push and dials as before when status is unavailable or the IP is unknown.
+- A sink that keeps failing is retried on an exponential backoff, starting at 30 seconds and capped at 30 minutes. The backoff resets on the next successful push and survives a source restart: `source --watch` and `source --once` pick up each sink's backoff from the previous run's `source-state.json`. Pushes inside the window skip that sink and still deliver to the others.
 - Sinks are pushed concurrently, each under its own timeout, so a dead sink no longer delays or starves the healthy ones.
 - Pushes started by the secrets-bus and discovery watchers share a 30-second rate cap, the same as the cookie watcher's, so a burst of file writes no longer starts a push per write.
 
