@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
@@ -50,15 +51,15 @@ func TestCmuxLiveInjection(t *testing.T) {
 		if a.surfaceID == "" {
 			return
 		}
-		_, _ = a.run("browser", "--surface", a.surfaceID, "cookies", "clear", "--url", url)
-		_, _ = a.run("rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
+		_, _ = a.run(context.Background(), "browser", "--surface", a.surfaceID, "cookies", "clear", "--url", url)
+		_, _ = a.run(context.Background(), "rpc", "surface.close", `{"surface_id":"`+a.surfaceID+`"}`)
 	})
 
 	if a.surfaceID == "" {
 		t.Fatal("adapter did not cache a surface after Push")
 	}
 
-	out, err := a.run("rpc", "browser.cookies.get", `{"surface_id":"`+a.surfaceID+`","url":"`+url+`"}`)
+	out, err := a.run(context.Background(), "rpc", "browser.cookies.get", `{"surface_id":"`+a.surfaceID+`","url":"`+url+`"}`)
 	if err != nil {
 		t.Fatalf("cookies.get: %v", err)
 	}

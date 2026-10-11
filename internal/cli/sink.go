@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -147,7 +148,6 @@ func runSink(cmd *cobra.Command, args []string) error {
 	}
 
 	logSinkStartupBlocklistStatus()
-	registerCmuxSurfaceOnce(cfg)
 
 	if pullFrom != "" {
 		pullURL, err := normalizePullURL(pullFrom)
@@ -242,29 +242,39 @@ func (rt *sinkRuntime) applier(ctx context.Context, transportSecret string) func
 	}
 }
 
-// cmuxRegisterOnce makes registerCmuxSurfaceOnce register at most once
-// per process. Tests replace it.
-var cmuxRegisterOnce = new(sync.Once)
+// cmuxSurfaces resolves the opt-in cmux delivery surface (sink.yaml
+// `cmux.enabled`) from the config each apply is handed. Every pull mode
+// reloads sink.yaml before it applies, so enabling, disabling, or
+// narrowing cmux takes effect on the next pull. Not registered in
+// sinkpush.init() because it carries config (binary path, host filter)
+// that package-load init cannot see.
+var cmuxSurfaces = &cmuxSurfaceCache{}
 
-// registerCmuxSurfaceOnce registers the cmux surface from cfg the first
-// time any sink mode (listener, pull loop, pull-once, background loop)
-// loads its config in this process.
-func registerCmuxSurfaceOnce(cfg *config.SinkConfig) {
-	cmuxRegisterOnce.Do(func() { registerCmuxSurface(cfg) })
+// cmuxSurfaceCache keeps one cmux adapter per distinct (binary, filter)
+// so unchanged settings reuse the adapter and its cached hidden tab, and
+// changed settings replace it.
+type cmuxSurfaceCache struct {
+	mu      sync.Mutex
+	binary  string
+	filter  []string
+	adapter *sinkpush.CmuxAdapter
 }
 
-// registerCmuxSurface registers the opt-in cmux delivery surface (sink.yaml
-// `cmux.enabled`). Registered here, not in sinkpush.init(), because it
-// carries config (binary path, host filter) the package-load init cannot
-// see. Once registered it fires after every sync via sinkpush.RunAll
-// alongside the built-in per-CLI adapters, and shows up in `doctor` and
-// `wizard verify-adapters` for free. Call it through
-// registerCmuxSurfaceOnce.
-func registerCmuxSurface(cfg *config.SinkConfig) {
-	if cfg.Cmux.Enabled {
-		sinkpush.Register(sinkpush.NewCmux(cfg.Cmux.CmuxPath, cfg.Cmux.DomainFilter))
+// adapters returns the cmux adapter for cfg, or none when cmux is off.
+func (c *cmuxSurfaceCache) adapters(cfg *config.SinkConfig) []sinkpush.Adapter {
+	if !cfg.Cmux.Enabled {
+		return nil
+	}
+	binary := sinkpush.ResolveCmuxBinary(cfg.Cmux.CmuxPath)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.adapter == nil || c.binary != binary || !slices.Equal(c.filter, cfg.Cmux.DomainFilter) {
+		c.binary = binary
+		c.filter = slices.Clone(cfg.Cmux.DomainFilter)
+		c.adapter = sinkpush.NewCmux(cfg.Cmux.CmuxPath, c.filter)
 		fmt.Fprintln(os.Stderr, "agentcookie sink: cmux delivery surface enabled")
 	}
+	return []sinkpush.Adapter{c.adapter}
 }
 
 func logSinkStartupBlocklistStatus() {
@@ -479,10 +489,15 @@ func applySealedEnvelope(
 	// #137: the union reads Chrome Safe Storage, so it runs only when
 	// skip_chrome_sqlite is off and an installed adapter can use the
 	// extra-profile cookies. Otherwise adapters get the envelope cookies.
+	//
+	// Adapters run under ctx, so pull-once's budget stops a stalled
+	// adapter command. cmux comes from this cfg, so a reloaded sink.yaml
+	// applies on the next pull.
 	var adapterResults []sinkpush.Result
-	unionedCookies := adapterCookieSet(cfg, cookies, blockMatcher)
+	extraAdapters := cmuxSurfaces.adapters(cfg)
+	unionedCookies := adapterCookieSet(cfg, cookies, blockMatcher, extraAdapters...)
 	if len(unionedCookies) > 0 {
-		adapterResults = sinkpush.RunAll(unionedCookies)
+		adapterResults = sinkpush.RunAll(ctx, unionedCookies, extraAdapters...)
 		logAdapterResults(adapterResults)
 	}
 
@@ -783,8 +798,8 @@ func replaceLevelDBDir(payload []byte, liveDir string) (int, error) {
 // envelope cookies, unioned with extra Chrome profiles only when the
 // Safe Storage gate allows the read and an installed adapter can consume
 // the extra-profile cookies.
-func adapterCookieSet(cfg *config.SinkConfig, cookies []chrome.Cookie, blockMatcher *protocol.BlocklistMatcher) []chrome.Cookie {
-	if !safeStorageReadAllowed(cfg) || !sinkpush.AnyInstalled() {
+func adapterCookieSet(cfg *config.SinkConfig, cookies []chrome.Cookie, blockMatcher *protocol.BlocklistMatcher, extra ...sinkpush.Adapter) []chrome.Cookie {
+	if !safeStorageReadAllowed(cfg) || !sinkpush.AnyInstalled(extra...) {
 		return cookies
 	}
 	return unionCookiesWithExtraProfiles(cookies, cfg.CDP.ProfileDir, blockMatcher)

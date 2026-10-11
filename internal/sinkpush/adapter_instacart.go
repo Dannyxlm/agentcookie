@@ -2,6 +2,7 @@ package sinkpush
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -69,6 +70,12 @@ func (a *InstacartAdapter) CookieHostPatterns() []string {
 // value on stdin. Returns the exec error wrapped with stderr context
 // when non-zero exit.
 func (a *InstacartAdapter) Push(cookies []chrome.Cookie) error {
+	return a.PushContext(context.Background(), cookies)
+}
+
+// PushContext is Push bounded by ctx: the `auth paste` child is killed
+// when ctx ends.
+func (a *InstacartAdapter) PushContext(ctx context.Context, cookies []chrome.Cookie) error {
 	header := formatCookieHeader(cookies)
 	if header == "" {
 		// Defensive: RunAll's filter should have caught this and
@@ -79,7 +86,8 @@ func (a *InstacartAdapter) Push(cookies []chrome.Cookie) error {
 	}
 
 	binary := a.resolveBinary()
-	cmd := exec.Command(binary, "auth", "paste")
+	cmd := exec.CommandContext(ctx, binary, "auth", "paste")
+	cmd.WaitDelay = childWaitDelay
 	cmd.Stdin = strings.NewReader(header)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

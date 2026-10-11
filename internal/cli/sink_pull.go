@@ -314,7 +314,6 @@ func runSinkPullOnce(ctx context.Context, w io.Writer) error {
 		return nil
 	}
 	defer lock.Close()
-	registerCmuxSurfaceOnce(cfg)
 
 	res := pullOnceLocked(ctx, cfg)
 	// A dry run never starts the loop: the loop writes real cookies.
@@ -480,7 +479,6 @@ func runTeammatePullLoop(ctx context.Context) error {
 			fmt.Fprintln(os.Stderr, "agentcookie sink --pull-loop: sink.yaml no longer asks for cadence turn+timer; exiting")
 			return errPullLoopDone
 		}
-		registerCmuxSurfaceOnce(cfg)
 		lock, ok, err := tryLock(pullLockPath())
 		if err != nil {
 			return err

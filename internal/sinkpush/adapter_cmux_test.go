@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -115,7 +116,7 @@ func flagValue(args []string, flag string) string {
 
 func newTestCmux(f *fakeCmux, filter []string) *CmuxAdapter {
 	a := &CmuxAdapter{binary: "/fake/cmux", domainFilter: filter}
-	a.run = f.run
+	a.run = func(_ context.Context, args ...string) (string, error) { return f.run(args...) }
 	a.sleep = func(time.Duration) {} // no real waits in tests
 	return a
 }

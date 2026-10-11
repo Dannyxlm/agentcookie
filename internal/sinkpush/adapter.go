@@ -24,7 +24,9 @@
 package sinkpush
 
 import (
+	"context"
 	"strings"
+	"time"
 
 	"github.com/mvanhorn/agentcookie/internal/chrome"
 )
@@ -65,6 +67,17 @@ type Adapter interface {
 	// not stop other adapters from running.
 	Push(cookies []chrome.Cookie) error
 }
+
+// ContextPusher is implemented by adapters whose Push runs child
+// commands. RunAll calls PushContext instead of Push so the caller's
+// context (pull-once's turn budget) stops those commands.
+type ContextPusher interface {
+	PushContext(ctx context.Context, cookies []chrome.Cookie) error
+}
+
+// childWaitDelay bounds how long a context-killed child command may keep
+// its output pipes open (a grandchild it forked) before Wait gives up.
+const childWaitDelay = 2 * time.Second
 
 // Result is one adapter's outcome from a RunAll pass.
 type Result struct {

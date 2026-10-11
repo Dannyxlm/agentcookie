@@ -24,7 +24,6 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/keystore"
 	"github.com/mvanhorn/agentcookie/internal/protocol"
-	"github.com/mvanhorn/agentcookie/internal/sinkpush"
 	"github.com/mvanhorn/agentcookie/internal/state"
 	"github.com/mvanhorn/agentcookie/internal/transport"
 )
@@ -570,38 +569,6 @@ func TestPullOnceApplyStaysInsideBudget(t *testing.T) {
 	}
 	if code == 0 {
 		t.Fatalf("a stalled apply must not report success: out=%q", out)
-	}
-}
-
-// cmux.enabled reaches cmux in --pull-once too, registered once.
-func TestPullOnceRegistersCmuxSurfaceOnce(t *testing.T) {
-	ts := newTeammateSink(t, "turn", "")
-	f, err := os.OpenFile(filepath.Join(ts.dir, "sink.yaml"), os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteString("cmux:\n  enabled: true\n  cmux_path: /nonexistent/cmux\n"); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	t.Cleanup(sinkpush.SetRegistryForTesting(nil))
-	prevOnce := cmuxRegisterOnce
-	cmuxRegisterOnce = new(sync.Once)
-	t.Cleanup(func() { cmuxRegisterOnce = prevOnce })
-
-	for range 2 {
-		if code, out := ts.pullOnce(t); code != 0 {
-			t.Fatalf("code=%d out=%q", code, out)
-		}
-	}
-	n := 0
-	for _, a := range sinkpush.All() {
-		if a.Name() == "cmux" {
-			n++
-		}
-	}
-	if n != 1 {
-		t.Fatalf("cmux registered %d times, want 1", n)
 	}
 }
 
