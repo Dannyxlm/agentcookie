@@ -162,6 +162,27 @@ Replace:
 - `your-mac.tailnet` with your Mac's Tailscale hostname (`tailscale status` on either machine)
 - The pairing code and URL with the values printed by the Mac source wizard
 
+### Teammates: your Tincan agents pull from the laptop
+
+List your own Agent Tincan agents by name in `~/.config/agentcookie/teammates.yaml` on the laptop, approve each agent's machine once in a dialog, and give each agent one standing line. The agent then pulls fresh cookies at the start of every turn (and every 5 to 15 minutes if it is always on) over Tailscale, never through the Tincan relay. Only the Tailscale node you approved can pair or pull. Start with `agentcookie teammates setup`; `agentcookie doctor` shows each teammate's state and names a missing tailnet ACL rule. The full guide is [docs/teammates.md](docs/teammates.md).
+
+### Linux teammate agents (pull from the laptop)
+
+An agent the laptop lists as a teammate does not use the setup above. It pulls from the laptop, so it needs no listener and no inbound access:
+
+```bash
+# Install the pinned release (the laptop's pairing notice carries the tag and one SHA256 per arch)
+bash teammate-install.sh v1.2.3 amd64=<sha256> arm64=<sha256>
+
+# One-time setup, with the values from the notice
+~/.local/bin/agentcookie join --from your-mac.tailnet.ts.net --code ABCD-EFGH-IJKL --as grokbot
+
+# At the start of every turn
+~/.local/bin/agentcookie sink --pull-once
+```
+
+`join` writes a pull-mode `sink.yaml` (no `listen.addr`), a sync-all `blocklist.yaml` if none exists, pairs, and pulls once. The proxy comes from `--proxy` or the `proxy` saved in the agent's Tincan `client.json`. `--pull-once` exits 0 when cookies are current, 3 when the laptop is unreachable (retry before the first logged-in action), and 4 when the machine needs to re-pair. With `--cadence turn+timer` it also keeps one background loop pulling every 5 to 15 minutes. The tailnet ACL must let the agent's tag reach `<laptop>:9998`.
+
 ### Linux CDP source (existing browser; no SQLite access)
 
 When the authenticated browser already runs on Linux, set `cdp_source` in its
@@ -399,6 +420,7 @@ The secrets bus (bearer tokens, API keys, OAuth refresh tokens) is untouched by 
 | [Protocol v1](docs/protocol.md) | wire format spec for future client implementations |
 | [Threat model](docs/threat-model.md) | what agentcookie does and does not protect against |
 | [FAQ](docs/faq.md) | common questions |
+| [Teammates](docs/teammates.md) | Tincan agents that pull cookies from the laptop: setup, approval, rebuilds, removal |
 | [Consumption](docs/consumption.md) | how tools read synced cookies and secrets on the sink |
 | [agent-sync runbook](docs/runbook-agent-sync.md) | browserUse / agent-browser via live CDP injection |
 | [Secrets bus v2 adoption spec](docs/spec-agentcookie-secrets-bus-v2-adoption.md) | `agentcookie.toml` manifest format |

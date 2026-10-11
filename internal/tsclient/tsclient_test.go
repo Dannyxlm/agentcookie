@@ -347,6 +347,26 @@ func resolveSinkURLWithStatus(st *Status, rawURL string) (string, error) {
 	return parsed.String(), nil
 }
 
+// Doctor names a teammate's ACL tag by looking up its bound node's
+// StableID in `tailscale status --json`.
+func TestStatus_PeerByStableIDCarriesTags(t *testing.T) {
+	raw := `{"Peer": {
+	  "k1": {"ID": "nUSER", "HostName": "laptop"},
+	  "k2": {"ID": "nGROK", "HostName": "grok-bot", "Tags": ["tag:grokbot", "tag:agents"]}
+	}}`
+	var st Status
+	if err := json.Unmarshal([]byte(raw), &st); err != nil {
+		t.Fatal(err)
+	}
+	p := st.PeerByStableID("nGROK")
+	if p == nil || p.HostName != "grok-bot" || len(p.Tags) != 2 || p.Tags[0] != "tag:grokbot" {
+		t.Fatalf("peer = %+v", p)
+	}
+	if st.PeerByStableID("nNONE") != nil || st.PeerByStableID("") != nil {
+		t.Fatal("unknown or empty StableID must match nothing")
+	}
+}
+
 func TestIsTailscaleIP(t *testing.T) {
 	cases := map[string]bool{
 		"100.64.0.1":         true,

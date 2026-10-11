@@ -39,6 +39,12 @@ type SourceState struct {
 	// written before multi-sink, in which case the top-level fields and the
 	// legacy SinkURL are the whole story.
 	Sinks []SinkPushState `json:"sinks,omitempty"`
+
+	// PullListener is "up" while source --watch serves GET /pull (and
+	// /pair) and "down" while it waits for a tailnet address. Empty when
+	// no listener has been started (source --once, or an older binary).
+	PullListener     string `json:"pull_listener,omitempty"`
+	PullListenerAddr string `json:"pull_listener_addr,omitempty"`
 }
 
 // SinkPushState is one fan-out sink's push record, keyed by peer hostname
@@ -159,7 +165,9 @@ func NewWriter(path string) *Writer {
 	return &Writer{path: path}
 }
 
-// Save writes v as JSON to the writer's path atomically (write-then-rename).
+// Save writes v as JSON to the writer's path atomically and durably: the
+// temp file is fsynced before the rename, and the directory after it (best
+// effort), so a crash or power loss leaves either the old or the new file.
 func (w *Writer) Save(v any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -178,11 +186,31 @@ func (w *Writer) Save(v any) error {
 		os.Remove(tmpName)
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
-	return os.Rename(tmpName, w.path)
+	if err := os.Rename(tmpName, w.path); err != nil {
+		return err
+	}
+	syncDir(filepath.Dir(w.path))
+	return nil
+}
+
+// syncDir fsyncs dir so a rename into it is durable. Best effort: some
+// filesystems refuse to fsync a directory, and the rename already happened.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // LoadSource reads source-state.json. Returns nil, nil when the file does not

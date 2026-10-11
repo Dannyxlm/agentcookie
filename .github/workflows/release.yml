@@ -45,9 +45,13 @@ jobs:
           name: linux-binaries
           path: dist/*.tar.gz
 
-  # Build darwin binaries on macOS (codesigning requires macOS)
+  # Build darwin binaries on macOS (codesigning requires macOS). It runs
+  # after build-linux because the darwin binary embeds the SHA256 of the
+  # Linux tarballs that publish uploads (the teammate pairing notice pins
+  # them); see docs/releasing.md.
   build-darwin:
     runs-on: macos-latest
+    needs: [build-linux]
     if: ${{ vars.RELEASE_CI_ENABLED == 'true' }}
     # Step-level `if:` cannot read the secrets context (GitHub rejects the
     # whole workflow file), so expose whether each secret is set here.
@@ -84,11 +88,22 @@ jobs:
             --team-id NM8VT393AR \
             --password "$AC_NOTARY_PASSWORD"
 
-      # Build, sign, and notarize a Universal 2 (arm64 + x86_64) binary.
-      # After this step bin/agentcookie runs natively on Intel and Apple
-      # Silicon Macs without Gatekeeper interactive approval.
-      - name: make release
-        run: make release
+      # The exact Linux tarballs publish will upload, so their digests can
+      # be embedded in the darwin build below.
+      - name: download linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries
+          path: dist/
+
+      # Build, sign, and notarize a Universal 2 (arm64 + x86_64) binary
+      # with the Linux tarball digests embedded. After this step
+      # bin/agentcookie runs natively on Intel and Apple Silicon Macs
+      # without Gatekeeper interactive approval.
+      - name: make release-pinned
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: make release-pinned TAG="$RELEASE_TAG"
 
       - name: build release tarball
         env:

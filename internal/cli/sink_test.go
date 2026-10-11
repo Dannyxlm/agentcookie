@@ -983,7 +983,7 @@ func TestAdapterCookieSet_InstalledAdapterReceivesUnion(t *testing.T) {
 	cfg, bm := unionTestFixture(t, adapter)
 	stub := stubChromeDecryptKey(t, func(int) ([]byte, error) { return safeStorageTestKey, nil })
 
-	sinkpush.RunAll(adapterCookieSet(cfg, unionTestEnvelope, bm))
+	sinkpush.RunAll(context.Background(), adapterCookieSet(cfg, unionTestEnvelope, bm))
 	if n := stub.count(); n != 1 {
 		t.Errorf("Safe Storage reads = %d, want 1", n)
 	}

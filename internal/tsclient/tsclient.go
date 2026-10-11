@@ -37,12 +37,17 @@ type Status struct {
 
 // PeerStatus mirrors the per-peer object Tailscale's status JSON emits.
 type PeerStatus struct {
+	// ID is the node's StableID, the same value WhoIs and Tincan's roster
+	// report.
+	ID             string   `json:"ID"`
 	HostName       string   `json:"HostName"`
 	DNSName        string   `json:"DNSName"`
 	TailscaleIPs   []string `json:"TailscaleIPs"`
 	ExitNodeOption bool     `json:"ExitNodeOption"`
 	ExitNode       bool     `json:"ExitNode"`
 	Online         bool     `json:"Online"`
+	// Tags are the node's ACL tags (tag:...), empty for a user-owned node.
+	Tags []string `json:"Tags"`
 }
 
 // FindCLI returns the path to the local Tailscale CLI. Checks PATH first,
@@ -97,6 +102,19 @@ func (s *Status) FindPeer(hostname string) *PeerStatus {
 			return p
 		}
 		if label, _, ok := strings.Cut(p.DNSName, "."); ok && strings.EqualFold(label, target) {
+			return p
+		}
+	}
+	return nil
+}
+
+// PeerByStableID returns the peer whose StableID is id, or nil.
+func (s *Status) PeerByStableID(id string) *PeerStatus {
+	if s == nil || id == "" {
+		return nil
+	}
+	for _, p := range s.Peer {
+		if p != nil && p.ID == id {
 			return p
 		}
 	}

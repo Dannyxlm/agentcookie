@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# release_asset_test.sh - Selection tests for the macOS installer and the
-# release-tarball archive name. No extra test framework; run:
+# release_asset_test.sh - Selection tests for the macOS installer, the
+# release-tarball archive name, the teammate installer, and the Linux
+# release pins embedded in the darwin build. No extra test framework; run:
 #
 #   bash scripts/release_asset_test.sh
 
@@ -701,6 +702,144 @@ if ! grep -qF "is missing the $APPLE_EVENTS_KEY entitlement" "$tmp/sign.err"; th
   fail "sign.sh did not print the missing-entitlement message for a false value"
 fi
 assert_eq "$(run_sign_with_stub true)" "0" "sign.sh passes when the entitlement is true"
+
+# teammate-install.sh: pinned tag + one pinned SHA256 per Linux arch, from
+# a local file:// release fixture (no network). The installer picks the
+# digest for the host arch.
+AGENTCOOKIE_TEAMMATE_INSTALL_LIB_ONLY=1
+# shellcheck disable=SC1091
+source "$ROOT/scripts/teammate-install.sh"
+tm="$tmp/teammate"
+tm_tag="v9.8.7"
+tm_arch="$(teammate_linux_arch "$(uname -m)")"
+if [[ "$tm_arch" == "amd64" ]]; then tm_other_arch="arm64"; else tm_other_arch="amd64"; fi
+tm_asset="$(teammate_asset_name "$tm_tag" "$tm_arch")"
+assert_eq "$tm_asset" "agentcookie_9.8.7_linux_${tm_arch}.tar.gz" "teammate asset name"
+mkdir -p "$tm/release/$tm_tag" "$tm/stage"
+printf '#!/bin/sh\necho agentcookie-teammate-fixture\n' > "$tm/stage/agentcookie"
+chmod +x "$tm/stage/agentcookie"
+tar -czf "$tm/release/$tm_tag/$tm_asset" -C "$tm/stage" agentcookie
+tm_sha="$(teammate_sha256_of "$tm/release/$tm_tag/$tm_asset")"
+tm_bad_sha="$(printf '0%.0s' {1..64})"
+tm_other_sha="$(printf 'f%.0s' {1..64})"
+
+# run_teammate_install DEST ARGS...: prints the exit code; stderr to $tm/err.
+run_teammate_install() {
+  local dest="$1" rc=0
+  shift
+  AGENTCOOKIE_RELEASE_BASE_URL="file://$tm/release" AGENTCOOKIE_INSTALL_DIR="$dest" \
+    bash "$ROOT/scripts/teammate-install.sh" "$@" >/dev/null 2>"$tm/err" || rc=$?
+  echo "$rc"
+}
+
+for ref in latest main HEAD 1.2.3 v1.2; do
+  assert_eq "$(run_teammate_install "$tm/bin-ref" "$ref" "$tm_arch=$tm_sha")" "2" "teammate-install refuses unpinned ref $ref"
+done
+if [[ -e "$tm/bin-ref/agentcookie" ]]; then
+  fail "teammate-install installed from an unpinned ref"
+fi
+
+# Argument shape: a bare digest, an unknown arch, a short digest, and no
+# pin at all are refused before any download.
+for bad in "$tm_sha" "riscv64=$tm_sha" "$tm_arch=abc" "$tm_arch="; do
+  assert_eq "$(run_teammate_install "$tm/bin-arg" "$tm_tag" "$bad")" "2" "teammate-install refuses pin argument '$bad'"
+done
+assert_eq "$(run_teammate_install "$tm/bin-arg" "$tm_tag")" "2" "teammate-install refuses a tag with no pin"
+if [[ -e "$tm/bin-arg/agentcookie" ]]; then
+  fail "teammate-install installed with a malformed pin argument"
+fi
+
+# The host arch has no pin (e.g. a release with no arm64 asset): refuse
+# clearly, naming the arch.
+assert_eq "$(run_teammate_install "$tm/bin-noarch" "$tm_tag" "$tm_other_arch=$tm_other_sha")" "2" "teammate-install refuses a host arch with no pin"
+if [[ -e "$tm/bin-noarch/agentcookie" ]]; then
+  fail "teammate-install installed without a pin for the host arch"
+fi
+if ! grep -qF "no pinned SHA256 for linux/$tm_arch" "$tm/err"; then
+  fail "teammate-install did not name the unpinned host arch: $(cat "$tm/err")"
+fi
+
+assert_eq "$(run_teammate_install "$tm/bin-bad" "$tm_tag" "$tm_arch=$tm_bad_sha" "$tm_other_arch=$tm_sha")" "4" "teammate-install refuses a SHA256 mismatch"
+if [[ -e "$tm/bin-bad/agentcookie" ]]; then
+  fail "teammate-install installed a binary whose SHA256 differs from the pinned value"
+fi
+if ! grep -qF "SHA256 mismatch" "$tm/err"; then
+  fail "teammate-install did not name the SHA256 mismatch"
+fi
+
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_other_arch=$tm_other_sha" "$tm_arch=$tm_sha")" "0" "teammate-install installs a pinned, matching asset for the host arch"
+if [[ ! -x "$tm/bin/agentcookie" ]] || [[ "$("$tm/bin/agentcookie")" != "agentcookie-teammate-fixture" ]]; then
+  fail "teammate-install did not install the release binary as an executable"
+fi
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_arch=$tm_sha")" "0" "teammate-install rerun replaces in place"
+if compgen -G "$tm/bin/.agentcookie.new.*" >/dev/null; then
+  fail "teammate-install left a temporary file behind"
+fi
+
+# --- Linux release pins (scripts/linux-release-pins.sh) ----------------
+# The darwin release build embeds the SHA256 of each published Linux
+# tarball. The script hashes dist/ after the Linux build and prints the
+# make arguments; it must refuse anything it cannot pin exactly.
+
+lp="$(mktemp -d -t agentcookie-pins.XXXXXX)"
+lp_tag="v9.9.9-rc.1"
+mkdir -p "$lp/dist" "$lp/amd-only"
+printf 'linux amd64 tarball\n' >"$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz"
+printf 'linux arm64 tarball\n' >"$lp/dist/agentcookie_9.9.9-rc.1_linux_arm64.tar.gz"
+cp "$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz" "$lp/amd-only/"
+lp_amd="$(shasum -a 256 "$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz" | awk '{print $1}')"
+lp_arm="$(shasum -a 256 "$lp/dist/agentcookie_9.9.9-rc.1_linux_arm64.tar.gz" | awk '{print $1}')"
+
+# run_pins ARGS...: prints "<exit>|<stdout>"; stderr to $lp/err.
+run_pins() {
+  local out rc=0
+  out="$(bash "$ROOT/scripts/linux-release-pins.sh" "$@" 2>"$lp/err")" || rc=$?
+  printf '%s|%s\n' "$rc" "$out"
+}
+
+assert_eq "$(run_pins "$lp_tag" "$lp/dist")" "0|LINUX_SHA256_AMD64=$lp_amd LINUX_SHA256_ARM64=$lp_arm" "linux-release-pins prints both digests as make arguments"
+assert_eq "$(run_pins "$lp_tag" "$lp/amd-only")" "0|LINUX_SHA256_AMD64=$lp_amd" "linux-release-pins pins amd64 only when there is no arm64 tarball"
+if ! grep -qF "linux_arm64" "$lp/err"; then
+  fail "linux-release-pins did not warn about the missing arm64 tarball: $(cat "$lp/err")"
+fi
+assert_eq "$(run_pins "v9.9.8" "$lp/dist")" "2|" "linux-release-pins refuses a tag with no linux_amd64 tarball"
+for ref in latest main 9.9.9 v9.9 v9.9.9-2-gabc1234 v9.9.9-dirty; do
+  assert_eq "$(run_pins "$ref" "$lp/dist")" "2|" "linux-release-pins refuses non-release ref $ref"
+done
+
+# A goreleaser checksums.txt that disagrees with the tarball on disk means
+# dist/ was rebuilt or tampered with; refuse to pin.
+mkdir -p "$lp/mismatch"
+cp "$lp/dist/"*.tar.gz "$lp/mismatch/"
+printf '%s  agentcookie_9.9.9-rc.1_linux_amd64.tar.gz\n%s  agentcookie_9.9.9-rc.1_linux_arm64.tar.gz\n' "$lp_amd" "$lp_amd" >"$lp/mismatch/checksums.txt"
+assert_eq "$(run_pins "$lp_tag" "$lp/mismatch")" "3|" "linux-release-pins refuses digests that disagree with checksums.txt"
+printf '%s  agentcookie_9.9.9-rc.1_linux_amd64.tar.gz\n%s  agentcookie_9.9.9-rc.1_linux_arm64.tar.gz\n' "$lp_amd" "$lp_arm" >"$lp/dist/checksums.txt"
+assert_eq "$(run_pins "$lp_tag" "$lp/dist")" "0|LINUX_SHA256_AMD64=$lp_amd LINUX_SHA256_ARM64=$lp_arm" "linux-release-pins accepts a matching checksums.txt"
+
+# --check-binary: the built darwin binary must carry every digest dist/
+# would pin, so a rebuilt Linux tarball after the darwin build is caught.
+printf 'binary %s and %s\n' "$lp_amd" "$lp_arm" >"$lp/bin-good"
+printf 'binary %s only\n' "$lp_amd" >"$lp/bin-amd"
+assert_eq "$(run_pins --check-binary "$lp/bin-good" "$lp_tag" "$lp/dist")" "0|" "linux-release-pins --check-binary accepts a binary with both digests"
+assert_eq "$(run_pins --check-binary "$lp/bin-amd" "$lp_tag" "$lp/dist")" "3|" "linux-release-pins --check-binary refuses a binary missing the arm64 digest"
+assert_eq "$(run_pins --check-binary "$lp/bin-amd" "$lp_tag" "$lp/amd-only")" "0|" "linux-release-pins --check-binary accepts an amd64-only pin"
+
+# The Makefile injects the digests into the darwin build's ldflags.
+lp_make="$(make -s -n -C "$ROOT" build LINUX_SHA256_AMD64="$lp_amd" LINUX_SHA256_ARM64="$lp_arm" 2>/dev/null || true)"
+for want in "-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxAMD64SHA256=$lp_amd" "-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxARM64SHA256=$lp_arm"; do
+  if [[ "$lp_make" != *"$want"* ]]; then
+    fail "make build does not pass '$want' (got: $lp_make)"
+  fi
+done
+lp_make="$(make -s -n -C "$ROOT" build 2>/dev/null || true)"
+if [[ "$lp_make" == *releaseLinux* ]]; then
+  fail "make build without LINUX_SHA256_* must embed no release pin (got: $lp_make)"
+fi
+# release-pinned needs TAG and refuses to run before any build when it is missing.
+if make -s -C "$ROOT" release-pinned >/dev/null 2>"$lp/err"; then
+  fail "make release-pinned without TAG succeeded"
+fi
+rm -rf "$lp"
 
 if [[ $failures -ne 0 ]]; then
   echo "$failures test(s) failed" >&2

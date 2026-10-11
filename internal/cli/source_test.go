@@ -360,6 +360,13 @@ func newSourcePushFixture(t *testing.T, cookies []chrome.Cookie) *sourcePushFixt
 	configDir := t.TempDir()
 	withConfigDir(t, configDir)
 
+	// Never consult the real tailnet: a sink host that happens to match a
+	// live Tailscale peer (for example "instinct") would be rewritten to its
+	// IP. Tests that exercise resolution install their own resolver.
+	t.Cleanup(SetResolveSinkURLForTesting(func(_ context.Context, rawURL string) (string, error) {
+		return rawURL, nil
+	}))
+
 	key := []byte("0123456789abcdef")
 	dbPath := filepath.Join(t.TempDir(), "Cookies")
 	seedSourceCookiesDB(t, dbPath, cookies, key)

@@ -28,8 +28,9 @@
 #      in the repo.
 #
 # This script is intentionally not part of `make release`. CI runs
-# `make release` first, then this script. Local releases can do the
-# same sequence.
+# `make release-pinned TAG=<tag>` first (after the Linux tarballs are
+# built, so their digests are embedded), then this script. Local releases
+# do the same sequence; see docs/releasing.md.
 
 set -euo pipefail
 

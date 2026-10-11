@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/mvanhorn/agentcookie/internal/cli/httpserver"
 	"github.com/mvanhorn/agentcookie/internal/config"
 	"github.com/mvanhorn/agentcookie/internal/keystore"
+	"github.com/mvanhorn/agentcookie/internal/pairing"
 	"github.com/mvanhorn/agentcookie/internal/transport"
 	"github.com/mvanhorn/agentcookie/internal/tsclient"
 )
@@ -30,6 +32,28 @@ type pullCache struct {
 	mu      sync.RWMutex
 	payload []byte
 	gen     uint64
+	// changedAt is when a stored envelope last differed from the one
+	// before it; the teammate staleness notice compares pulls against it.
+	changedAt time.Time
+}
+
+// ChangedAt returns when the served envelope last changed (zero before
+// the first one).
+func (c *pullCache) ChangedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.changedAt
+}
+
+// setLocked stores payload and notes a change. c.mu must be held.
+func (c *pullCache) setLocked(payload []byte) {
+	if !bytes.Equal(c.payload, payload) {
+		c.changedAt = time.Now()
+	}
+	c.payload = append([]byte(nil), payload...)
 }
 
 func newPullCache() *pullCache { return &pullCache{} }
@@ -50,7 +74,7 @@ func (c *pullCache) Store(payload []byte) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.payload = append([]byte(nil), payload...)
+	c.setLocked(payload)
 }
 
 func (c *pullCache) StoreIfCurrent(gen uint64, payload []byte) {
@@ -62,7 +86,7 @@ func (c *pullCache) StoreIfCurrent(gen uint64, payload []byte) {
 	if gen != c.gen {
 		return
 	}
-	c.payload = append([]byte(nil), payload...)
+	c.setLocked(payload)
 }
 
 func (c *pullCache) Load() []byte {
@@ -106,8 +130,17 @@ func (c *pullCache) ClearIfCurrent(gen uint64) {
 // both leave a copy for inbound-blocked sinks.
 var pullPayloadCache = newPullCache()
 
-func pullAuthSecrets(configDir, legacy string) []string {
-	var secrets []string
+// peerSecret is one credential /pull accepts: a paired peer's key (name
+// is its keys/ filename) or the legacy shared secret.
+type peerSecret struct {
+	name   string
+	secret string
+	legacy bool
+}
+
+// pullAuthPeers lists every paired key plus the legacy shared secret.
+func pullAuthPeers(configDir, legacy string) []peerSecret {
+	var out []peerSecret
 	peers, err := keystore.List(configDir)
 	if err == nil {
 		for _, peer := range peers {
@@ -115,55 +148,77 @@ func pullAuthSecrets(configDir, legacy string) []string {
 			if loadErr != nil || pk == nil || len(pk.Key) == 0 {
 				continue
 			}
-			secrets = append(secrets, string(pk.Key))
+			out = append(out, peerSecret{name: peer, secret: string(pk.Key)})
 		}
 	}
 	if legacy != "" {
-		secrets = append(secrets, legacy)
+		out = append(out, peerSecret{secret: legacy, legacy: true})
+	}
+	return out
+}
+
+func pullAuthSecrets(configDir, legacy string) []string {
+	var secrets []string
+	for _, p := range pullAuthPeers(configDir, legacy) {
+		secrets = append(secrets, p.secret)
 	}
 	return secrets
 }
 
+// newPullHandler serves /pull to any holder of one of secrets (the
+// pre-teammate rule).
 func newPullHandler(cache *pullCache, secrets func() []string) http.Handler {
+	return newPullHandlerWithAuth(cache, legacySecretsAuth(secrets))
+}
+
+func newPullHandlerWithAuth(cache *pullCache, auth pullAuth) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "GET only", http.StatusMethodNotAllowed)
 			return
 		}
 		httpserver.LimitedReader(r, httpserver.Defaults(httpserver.SourcePull).MaxBodyBytes)
-		var secretList []string
-		if secrets != nil {
-			secretList = secrets()
-		}
-		matched, err := transport.VerifyRequestAny(r, secretList, time.Now(), 0)
-		if err != nil {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		d := auth.authorizePull(r)
+		if d.status != 0 {
+			http.Error(w, d.msg, d.status)
 			return
 		}
 		payload := cache.Load()
 		if len(payload) == 0 {
 			w.WriteHeader(http.StatusNoContent)
+			if d.served != nil {
+				d.served()
+			}
 			return
 		}
-		sealed, err := transport.SealWithSecret(payload, matched)
+		sealed, err := transport.SealWithSecret(payload, d.secret)
 		if err != nil {
 			http.Error(w, "seal payload: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(sealed)
+		if d.served != nil {
+			d.served()
+		}
 	})
 }
 
-func newPullServer(addr, configDir, legacy string, cache *pullCache) *http.Server {
+// newPullMux builds the 9998 handler once, so a rebind on a tailnet IP
+// change keeps serving the same state.
+func newPullMux(configDir, legacy string, cache *pullCache, hub *teammateHub) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/pull", newPullHandler(cache, func() []string {
-		return pullAuthSecrets(configDir, legacy)
-	}))
+	mux.Handle("/pull", newPullHandlerWithAuth(cache, newPullAuthorizer(configDir, legacy, hub)))
+	if hub != nil {
+		// Teammate pairing (KTD7) shares this server so it never fights
+		// `source --watch` for port 9998. It is a 404 unless a teammate
+		// pairing is pending, as the route was before it existed.
+		mux.Handle("/pair", hub.pairHandler(pairing.LocalHostname()))
+	}
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintln(w, "ok")
 	})
-	return httpserver.Configure(&http.Server{Addr: addr, Handler: mux}, httpserver.SourcePull)
+	return mux
 }
 
 func resolveSourcePullListen(ctx context.Context, explicit string) (string, error) {
@@ -180,29 +235,81 @@ func resolveSourcePullListen(ctx context.Context, explicit string) (string, erro
 	return fmt.Sprintf("%s:%s", ip, defaultPullListenPort), nil
 }
 
+// Pull listener seams. Production binds this machine's Tailscale 100.x
+// address on port 9998; tests swap these with
+// setPullListenerSeamsForTesting.
+var (
+	pullListenIPFunc        = tsclient.RequireTailnetIP
+	pullListenPort          = defaultPullListenPort
+	pullListenRetryMin      = 2 * time.Second
+	pullListenRetryMax      = time.Minute
+	pullListenCheckInterval = 30 * time.Second
+)
+
+func setPullListenerSeamsForTesting(ipFn func(context.Context) (string, error), port string, retryMin, check time.Duration) func() {
+	prevIP, prevPort, prevMin, prevMax, prevCheck := pullListenIPFunc, pullListenPort, pullListenRetryMin, pullListenRetryMax, pullListenCheckInterval
+	pullListenIPFunc, pullListenPort, pullListenRetryMin, pullListenRetryMax, pullListenCheckInterval = ipFn, port, retryMin, 4*retryMin, check
+	return func() {
+		pullListenIPFunc, pullListenPort, pullListenRetryMin, pullListenRetryMax, pullListenCheckInterval = prevIP, prevPort, prevMin, prevMax, prevCheck
+	}
+}
+
 // startWatchPullListener serves GET /pull for the life of source --watch.
-// Auto-detect failure (no Tailscale) logs a warning and leaves push intact;
-// an explicit --pull-listen is required to bind and fails the command on error.
-// The TCP bind happens synchronously so a colliding pairing port fails
-// `source --watch` instead of looking successful while /pull is down.
-func startWatchPullListener(ctx context.Context, cfg *config.SourceConfig) error {
-	addr, err := resolveSourcePullListen(ctx, sourcePullListen)
-	if err != nil {
-		if sourcePullListen == "" {
-			fmt.Fprintf(os.Stderr, "agentcookie source --watch: pull listener disabled (%v)\n", err)
-			return nil
-		}
-		return err
+// An explicit --pull-listen binds once and fails the command on error. The
+// default tailnet address is supervised (KTD9): when Tailscale is not up
+// yet the listener retries with backoff instead of staying off for the
+// life of the daemon, and it rebinds when the tailnet IP changes. A
+// colliding port at startup still fails `source --watch` so a held pairing
+// port is not mistaken for a working /pull. onStatus (may be nil) reports
+// every up/down change.
+func startWatchPullListener(ctx context.Context, cfg *config.SourceConfig, onStatus func(up bool, addr string)) error {
+	if onStatus == nil {
+		onStatus = func(bool, string) {}
 	}
 	legacy := ""
 	if cfg != nil {
 		legacy = cfg.Security.SharedSecret
 	}
+	handler := newPullMux(common.ConfigDir, legacy, pullPayloadCache, activeTeammates)
+	if sourcePullListen != "" {
+		addr, err := resolveSourcePullListen(ctx, sourcePullListen)
+		if err != nil {
+			return err
+		}
+		if _, err := servePull(ctx, addr, handler); err != nil {
+			return err
+		}
+		onStatus(true, addr)
+		return nil
+	}
+	sup := &pullListenerSupervisor{
+		handler:  handler,
+		onStatus: onStatus,
+		ipFn:     pullListenIPFunc,
+		port:     pullListenPort,
+		retryMin: pullListenRetryMin,
+		retryMax: pullListenRetryMax,
+		check:    pullListenCheckInterval,
+	}
+	ip, err := sup.ipFn(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agentcookie source --watch: pull listener waiting for Tailscale (%v); retrying\n", err)
+		onStatus(false, "")
+	} else if err := sup.bind(ctx, ip); err != nil {
+		return err
+	}
+	go sup.run(ctx)
+	return nil
+}
+
+// servePull binds addr and serves handler until ctx ends or the returned
+// server is shut down.
+func servePull(ctx context.Context, addr string, handler http.Handler) (*http.Server, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("pull listen %s: %w", addr, err)
+		return nil, fmt.Errorf("pull listen %s: %w", addr, err)
 	}
-	srv := newPullServer(addr, common.ConfigDir, legacy, pullPayloadCache)
+	srv := httpserver.Configure(&http.Server{Addr: ln.Addr().String(), Handler: handler}, httpserver.SourcePull)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -215,5 +322,91 @@ func startWatchPullListener(ctx context.Context, cfg *config.SourceConfig) error
 			fmt.Fprintf(os.Stderr, "agentcookie source --watch: pull listener: %v\n", err)
 		}
 	}()
+	return srv, nil
+}
+
+// pullListenerSupervisor keeps the default /pull listener bound to the
+// current tailnet IP.
+type pullListenerSupervisor struct {
+	handler  http.Handler
+	onStatus func(up bool, addr string)
+	ipFn     func(context.Context) (string, error)
+	port     string
+	retryMin time.Duration
+	retryMax time.Duration
+	check    time.Duration
+
+	ip     string
+	srv    *http.Server
+	cancel context.CancelFunc
+}
+
+func (s *pullListenerSupervisor) bind(ctx context.Context, ip string) error {
+	srvCtx, cancel := context.WithCancel(ctx)
+	srv, err := servePull(srvCtx, net.JoinHostPort(ip, s.port), s.handler)
+	if err != nil {
+		cancel()
+		return err
+	}
+	s.ip, s.srv, s.cancel = ip, srv, cancel
+	s.onStatus(true, srv.Addr)
 	return nil
+}
+
+func (s *pullListenerSupervisor) down() {
+	if s.srv == nil {
+		return
+	}
+	s.cancel()
+	shutCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = s.srv.Shutdown(shutCtx)
+	s.ip, s.srv, s.cancel = "", nil, nil
+	s.onStatus(false, "")
+}
+
+func (s *pullListenerSupervisor) run(ctx context.Context) {
+	backoff := s.retryMin
+	for {
+		wait := s.check
+		if s.srv == nil {
+			wait = backoff
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			if s.srv != nil {
+				s.cancel()
+			}
+			return
+		case <-timer.C:
+		}
+		ip, err := s.ipFn(ctx)
+		if err != nil {
+			// No tailnet address at all: the bound IP is gone, so report
+			// down. Other errors (an ambiguous second 100.x) keep the
+			// current binding rather than flapping.
+			if s.srv != nil && errors.Is(err, tsclient.ErrNoTailnetInterface) {
+				fmt.Fprintf(os.Stderr, "agentcookie source --watch: tailnet address gone; pull listener down until Tailscale is back\n")
+				s.down()
+			}
+			backoff = min(backoff*2, s.retryMax)
+			continue
+		}
+		if s.srv != nil && ip == s.ip {
+			backoff = s.retryMin
+			continue
+		}
+		if s.srv != nil {
+			fmt.Fprintf(os.Stderr, "agentcookie source --watch: tailnet IP changed %s -> %s; rebinding pull listener\n", s.ip, ip)
+			s.down()
+		}
+		if err := s.bind(ctx, ip); err != nil {
+			fmt.Fprintf(os.Stderr, "agentcookie source --watch: %v; retrying\n", err)
+			backoff = min(backoff*2, s.retryMax)
+			continue
+		}
+		backoff = s.retryMin
+	}
 }

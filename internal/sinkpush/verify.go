@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -163,14 +164,14 @@ func (a *CmuxAdapter) verifyOne(s VerifySpec) VerifyResult {
 	defer a.closeProbeSurface(sid)
 
 	navParams, _ := json.Marshal(map[string]any{"surface_id": sid, "url": s.URL})
-	if _, err := a.run("rpc", "browser.navigate", string(navParams)); err != nil {
+	if _, err := a.run(context.Background(), "rpc", "browser.navigate", string(navParams)); err != nil {
 		res.Detail = fmt.Sprintf("navigate error: %v", err)
 		return res
 	}
 
 	script := probeScript(s.Predicate, s.Host)
 	for attempt := range verifyMaxAttempts {
-		raw, err := a.run("rpc", "browser.eval", probeEvalParams(sid, script))
+		raw, err := a.run(context.Background(), "rpc", "browser.eval", probeEvalParams(sid, script))
 		if err != nil {
 			res.Detail = fmt.Sprintf("eval error: %v", err)
 		} else if ready, authed, perr := parseProbeResult(raw); perr != nil {
@@ -205,7 +206,7 @@ func (a *CmuxAdapter) verifyOne(s VerifySpec) VerifyResult {
 // on why navigate-at-create races cookie propagation). Distinct from the cached
 // injection surface so the probe can be closed without disturbing injection.
 func (a *CmuxAdapter) openProbeSurface() (string, error) {
-	out, err := a.run("new-surface", "--type", "browser", "--url", "about:blank", "--focus", "false")
+	out, err := a.run(context.Background(), "new-surface", "--type", "browser", "--url", "about:blank", "--focus", "false")
 	if err != nil {
 		return "", err
 	}
@@ -223,7 +224,7 @@ func (a *CmuxAdapter) closeProbeSurface(sid string) {
 	if err != nil {
 		return
 	}
-	_, _ = a.run("rpc", "surface.close", string(params))
+	_, _ = a.run(context.Background(), "rpc", "surface.close", string(params))
 }
 
 // probeEvalParams builds browser.eval params for a synchronous expression.

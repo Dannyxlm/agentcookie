@@ -210,6 +210,11 @@ func runSource(cmd *cobra.Command, args []string) error {
 	// opt in without a flag edit.
 	skipDBSC := sourceSkipDBSC || os.Getenv("AGENTCOOKIE_SKIP_DBSC_SUSPECT") == "1"
 
+	// Teammate mode: load teammates.yaml (absent = off, no behavior
+	// change) and migrate any listed legacy push peer before the first
+	// push, in --once too. --watch also hot-reloads edits.
+	activeTeammates = startTeammates(cmd.Context(), common.ConfigDir, home, cfg, sourceWatch)
+
 	push := func(ctx context.Context) (int, error) {
 		return pushWithFreshBlocklist(ctx, cfg, key, sourceDryRun, sourceVerbose, skipDBSC, srcState, stateWriter)
 	}
@@ -231,9 +236,14 @@ func runSource(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if err := startWatchPullListener(cmd.Context(), cfg); err != nil {
+	if err := startWatchPullListener(cmd.Context(), cfg, func(up bool, addr string) {
+		recordPullListenerState(srcState, stateWriter, up, addr)
+	}); err != nil {
 		return err
 	}
+	// Teammate lifecycle: roster polling, approval, pairing notices and
+	// re-pairs. Idle until teammates.yaml lists someone.
+	startTeammateLifecycle(cmd.Context(), activeTeammates, home)
 
 	if cfg.CDPSource.Enabled {
 		return runCDPSourceWatch(cmd.Context(), push, cfg.CDPSource.Endpoint, sourceVerbose)
@@ -456,6 +466,29 @@ func aggregateSinkResults(results []sinkResult) (posted int, sinkErrs []error) {
 	return posted, sinkErrs
 }
 
+// sourceStateMu guards srcState, which push cycles and the pull listener
+// supervisor both update.
+var sourceStateMu sync.Mutex
+
+// recordPullListenerState records whether GET /pull is being served
+// (pull_listener: up|down) in source state.
+func recordPullListenerState(srcState *state.SourceState, stateWriter *state.Writer, up bool, addr string) {
+	if srcState == nil {
+		return
+	}
+	sourceStateMu.Lock()
+	defer sourceStateMu.Unlock()
+	srcState.PullListener = "down"
+	srcState.PullListenerAddr = ""
+	if up {
+		srcState.PullListener = "up"
+		srcState.PullListenerAddr = addr
+	}
+	if stateWriter != nil {
+		_ = stateWriter.Save(srcState)
+	}
+}
+
 func recordSourcePushResult(
 	srcState *state.SourceState,
 	stateWriter *state.Writer,
@@ -466,6 +499,8 @@ func recordSourcePushResult(
 	if srcState == nil {
 		return
 	}
+	sourceStateMu.Lock()
+	defer sourceStateMu.Unlock()
 	now := sourceNow().UTC()
 	// A read/envelope-phase failure (err != nil) is recorded once at the
 	// top level; no per-sink attempt happened.
@@ -727,7 +762,22 @@ func pushOnce(
 	// URL-resolution, or POST) is isolated to that sink and recorded. A sink
 	// inside its backoff window is skipped without an attempt, and a sink
 	// whose peer Tailscale reports offline is skipped as asleep.
-	sinks := cfg.ResolvedSinks()
+	//
+	// A legacy push peer migrated to teammate mode is never dialed again (it
+	// pulls instead): it is dropped silently, not recorded as a failure, and
+	// source.yaml is left untouched. While teammate history cannot be
+	// checked, a named push is held and reported as failed instead (fail
+	// closed).
+	var sinks []config.SinkTarget
+	var held []error
+	for _, sink := range cfg.ResolvedSinks() {
+		heldErr := activeTeammates.PushHeld(sink.Peer)
+		if heldErr == nil && activeTeammates.SuppressPush(sink.Peer) {
+			continue
+		}
+		sinks = append(sinks, sink)
+		held = append(held, heldErr)
+	}
 	now := sourceNow()
 	results := make([]sinkResult, len(sinks))
 	replies := make([]string, len(sinks))
@@ -735,8 +785,15 @@ func pushOnce(
 	var wg sync.WaitGroup
 	for i, sink := range sinks {
 		results[i] = sinkResult{Peer: sink.Peer, URL: sink.URL}
+		if held[i] != nil {
+			results[i].Err = held[i]
+			continue
+		}
 		if srcState != nil {
-			if until := srcState.SinkFor(sink.Peer, sink.URL).BackoffUntil; now.Before(until) {
+			sourceStateMu.Lock()
+			until := srcState.SinkFor(sink.Peer, sink.URL).BackoffUntil
+			sourceStateMu.Unlock()
+			if now.Before(until) {
 				results[i].SkippedUntil = until
 				continue
 			}

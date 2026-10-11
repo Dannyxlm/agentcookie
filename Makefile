@@ -15,6 +15,12 @@
 #   make release    - build-universal + sign + notarize in one shot (a
 #                     fully-portable Universal 2 binary that launches on any
 #                     Intel or Apple Silicon Mac without prompts)
+#   make release-pinned TAG=vX.Y.Z
+#                   - the tagged release build: hash the Linux tarballs
+#                     already in dist/ (scripts/linux-release-pins.sh), run
+#                     `make release` with those digests embedded, and check
+#                     the binary carries them. Build the Linux tarballs
+#                     first; see docs/releasing.md.
 #   make verify     - print the designated requirement of bin/agentcookie
 #   make test       - go test -race ./... and scripts/release_asset_test.sh
 #   make vet        - go vet ./...
@@ -41,8 +47,22 @@ PKG := ./cmd/agentcookie
 # to match goreleaser's {{ .Version }}. Falls back to the in-source default when
 # git is unavailable (e.g. building from a release tarball).
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//')
+LDFLAGS :=
 ifneq ($(VERSION),)
-LDFLAGS := -X github.com/mvanhorn/agentcookie/internal/cli.Version=$(VERSION)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.Version=$(VERSION)
+endif
+
+# The SHA256 of this release's published Linux tarballs, embedded so the
+# laptop's teammate pairing notice can pin them without downloading
+# anything. Empty (the default) builds a binary that sends no pairing
+# notice. `make release-pinned` fills them from dist/; see docs/releasing.md.
+LINUX_SHA256_AMD64 ?=
+LINUX_SHA256_ARM64 ?=
+ifneq ($(LINUX_SHA256_AMD64),)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxAMD64SHA256=$(LINUX_SHA256_AMD64)
+endif
+ifneq ($(LINUX_SHA256_ARM64),)
+LDFLAGS += -X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxARM64SHA256=$(LINUX_SHA256_ARM64)
 endif
 
 GOBIN := $(shell go env GOBIN)
@@ -50,11 +70,30 @@ ifeq ($(GOBIN),)
 GOBIN := $(shell go env GOPATH)/bin
 endif
 
-.PHONY: all build build-universal install sign notarize release verify test vet clean
+.PHONY: all build build-universal install sign notarize release release-pinned verify test vet clean
 
 all: build sign
 
 release: build-universal sign notarize
+
+# release-pinned - the tagged release build (docs/releasing.md). Needs the
+# Linux tarballs for TAG in dist/ already: their digests are computed here,
+# before the darwin build, and embedded in it. The checked-out commit must
+# be exactly TAG on a clean tree so the binary's version is the tag.
+release-pinned:
+	@if [[ -z "$(TAG)" ]]; then \
+	  echo "make release-pinned: set TAG, e.g. make release-pinned TAG=v1.3.0" >&2; \
+	  exit 2; \
+	fi
+	@if [[ "v$(VERSION)" != "$(TAG)" ]]; then \
+	  echo "make release-pinned: git describe gives '$(VERSION)', not $(TAG); check out the tag on a clean tree" >&2; \
+	  exit 2; \
+	fi
+	set -euo pipefail; \
+	pins="$$(scripts/linux-release-pins.sh "$(TAG)")"; \
+	echo "make release-pinned: embedding $$pins"; \
+	$(MAKE) release $$pins; \
+	scripts/linux-release-pins.sh --check-binary $(BINARY) "$(TAG)"
 
 build:
 	@mkdir -p $(BIN_DIR)

@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -115,7 +116,7 @@ func flagValue(args []string, flag string) string {
 
 func newTestCmux(f *fakeCmux, filter []string) *CmuxAdapter {
 	a := &CmuxAdapter{binary: "/fake/cmux", domainFilter: filter}
-	a.run = f.run
+	a.run = func(_ context.Context, args ...string) (string, error) { return f.run(args...) }
 	a.sleep = func(time.Duration) {} // no real waits in tests
 	return a
 }
@@ -652,5 +653,19 @@ func TestCmuxPush_PermissionDeniedHardFails(t *testing.T) {
 	err := a.Push([]chrome.Cookie{{HostKey: ".x.com", Name: "a", Value: "1"}})
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("permission denied must hard-fail, got %v", err)
+	}
+}
+
+// A settings change keeps the existing hidden tab instead of opening a
+// second one on the next push.
+func TestCmuxAdapter_ReconfiguredKeepsSurface(t *testing.T) {
+	old := NewCmux("/nonexistent/cmux", []string{"%github.com"})
+	old.surfaceID = "surface:7"
+	n := old.Reconfigured("/other/cmux", []string{"%example.com"})
+	if n.surfaceID != "surface:7" {
+		t.Fatalf("surface = %q, want the old tab surface:7", n.surfaceID)
+	}
+	if n.CLIBinary() != "/other/cmux" || len(n.CookieHostPatterns()) != 1 || n.CookieHostPatterns()[0] != "%example.com" {
+		t.Fatalf("settings not applied: binary %q filter %v", n.CLIBinary(), n.CookieHostPatterns())
 	}
 }

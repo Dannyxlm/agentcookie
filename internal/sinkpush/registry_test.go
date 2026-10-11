@@ -1,6 +1,7 @@
 package sinkpush
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -35,7 +36,7 @@ func TestRunAll_RunsInRegistrationOrder(t *testing.T) {
 	Register(a)
 	Register(b)
 
-	results := RunAll([]chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
+	results := RunAll(context.Background(), []chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
@@ -57,7 +58,7 @@ func TestRunAll_FiltersByHostPattern(t *testing.T) {
 		{HostKey: ".airbnb.com", Name: "session", Value: "a1"},
 		{HostKey: ".github.com", Name: "user", Value: "g1"},
 	}
-	results := RunAll(cookies)
+	results := RunAll(context.Background(), cookies)
 	if len(ic.pushed) != 1 || len(ic.pushed[0]) != 2 {
 		t.Errorf("instacart: expected 1 Push call with 2 cookies, got %d calls, %v", len(ic.pushed), ic.pushed)
 	}
@@ -74,7 +75,7 @@ func TestRunAll_SkipsNotInstalledAdapter(t *testing.T) {
 	a := &stubAdapter{name: "missing", installed: false, patterns: []string{"%example%"}}
 	Register(a)
 
-	results := RunAll([]chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
+	results := RunAll(context.Background(), []chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(results))
 	}
@@ -94,7 +95,7 @@ func TestRunAll_SkipsWhenNoMatchingCookies(t *testing.T) {
 	a := &stubAdapter{name: "instacart", installed: true, patterns: []string{"%instacart%"}}
 	Register(a)
 
-	results := RunAll([]chrome.Cookie{
+	results := RunAll(context.Background(), []chrome.Cookie{
 		{HostKey: ".github.com", Name: "x", Value: "1"},
 	})
 	if !results[0].Skipped {
@@ -115,7 +116,7 @@ func TestRunAll_OneAdapterFailureDoesNotBlockOthers(t *testing.T) {
 	Register(bad)
 	Register(good)
 
-	results := RunAll([]chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
+	results := RunAll(context.Background(), []chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
 	if results[0].Err == nil {
 		t.Errorf("expected broken adapter to report Err")
 	}
@@ -129,7 +130,7 @@ func TestRunAll_OneAdapterFailureDoesNotBlockOthers(t *testing.T) {
 
 func TestRunAll_EmptyRegistryReturnsEmpty(t *testing.T) {
 	resetForTesting()
-	results := RunAll([]chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
+	results := RunAll(context.Background(), []chrome.Cookie{{HostKey: ".example.com", Name: "x", Value: "1"}})
 	if len(results) != 0 {
 		t.Errorf("expected 0 results from empty registry, got %d", len(results))
 	}
@@ -145,7 +146,7 @@ func TestRunAll_EmptyHostPatternsGetsEveryCookie(t *testing.T) {
 		{HostKey: ".airbnb.com", Name: "session", Value: "a1"},
 		{HostKey: ".github.com", Name: "user", Value: "g1"},
 	}
-	results := RunAll(cookies)
+	results := RunAll(context.Background(), cookies)
 	if results[0].Pushed != 3 {
 		t.Errorf("greedy adapter with nil patterns should get all 3 cookies, got Pushed=%d", results[0].Pushed)
 	}

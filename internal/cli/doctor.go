@@ -78,6 +78,14 @@ type doctorDeps struct {
 	SourceAdapterPassword      func(chrome.Browser) (string, error)
 	SourceAdapterDecrypt       func(path string, key []byte) error
 
+	// Home is the user's home directory (teammates-state.json lives under
+	// it). Now is the clock for teammate ages; nil means time.Now.
+	// NodeTags returns a Tailscale node's ACL tags by StableID; nil means
+	// the live `tailscale status --json` lookup.
+	Home     string
+	Now      func() time.Time
+	NodeTags func(nodeID string) ([]string, error)
+
 	// CmuxSessionHealth verifies that browser-bound-session hosts (e.g.
 	// github.com) actually authenticate in the live cmux browser. Injected so
 	// tests don't open a real browser surface; nil falls back to the live
@@ -108,6 +116,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	home, _ := os.UserHomeDir()
 	deps := doctorDeps{
 		ConfigDir:       common.ConfigDir,
+		Home:            home,
 		BinarySignature: probeBinarySignature,
 		TailscaleIP: func() (string, error) {
 			return tsclient.RequireTailnetIP(context.Background())
@@ -220,6 +229,10 @@ func buildReport(d doctorDeps) DoctorReport {
 			Detail:   "sink-only install",
 		})
 	}
+
+	// 7a. Teammates -- only when teammates.yaml exists: the pull
+	// listener, the list, Tincan, and one line per teammate.
+	checks = append(checks, checkTeammates(d)...)
 
 	// 8. Sealing -- sink role only.
 	if sinkCfg != nil {
