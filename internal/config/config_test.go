@@ -1025,3 +1025,42 @@ func TestSourceConfigYAMLKeysUnchangedForOlderBinaries(t *testing.T) {
 		t.Fatalf("source.yaml keys = %v, want %v (teammate mode must not add source.yaml keys)", got, want)
 	}
 }
+
+// Pull mode (teammate join) never binds a listener, so sink.yaml written by
+// `agentcookie join` has no listen.addr and must still load.
+func TestLoadSinkPullModeNeedsNoListenAddr(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "sink.yaml", `
+pull:
+  from: mac.tail1234.ts.net
+  cadence: turn+timer
+  proxy: http://localhost:1055
+peer:
+  hostname: mac.tail1234.ts.net
+skip_chrome_sqlite: true
+`)
+	cfg, err := LoadSink(dir)
+	if err != nil {
+		t.Fatalf("LoadSink pull mode: %v", err)
+	}
+	if !cfg.PullMode() {
+		t.Fatal("PullMode() = false, want true")
+	}
+	if cfg.Pull.From != "mac.tail1234.ts.net" || cfg.Pull.Cadence != CadenceTurnTimer || cfg.Pull.Proxy != "http://localhost:1055" {
+		t.Fatalf("pull = %+v", cfg.Pull)
+	}
+}
+
+func TestLoadSinkPullModeRejectsUnknownCadence(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "sink.yaml", `
+pull:
+  from: mac.tail1234.ts.net
+  cadence: hourly
+peer:
+  hostname: mac.tail1234.ts.net
+`)
+	if _, err := LoadSink(dir); err == nil || !strings.Contains(err.Error(), "cadence") {
+		t.Fatalf("expected cadence error, got %v", err)
+	}
+}

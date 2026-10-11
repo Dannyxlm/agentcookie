@@ -316,6 +316,12 @@ func RunSource(ctx context.Context, listenAddr, localHostname string, w io.Write
 // send our public key + the code, receive source's public key, derive the
 // shared key.
 func RunSink(ctx context.Context, sourcePairURL string, providedCode Code, localHostname string) (*HandshakeResult, error) {
+	return RunSinkWithClient(ctx, httpserver.Client(httpserver.PairClient), sourcePairURL, providedCode, localHostname)
+}
+
+// RunSinkWithClient is RunSink over a caller-supplied HTTP client, for a
+// sink that reaches the source only through a configured proxy.
+func RunSinkWithClient(ctx context.Context, client *http.Client, sourcePairURL string, providedCode Code, localHostname string) (*HandshakeResult, error) {
 	curve := ecdh.X25519()
 	priv, err := curve.GenerateKey(rand.Reader)
 	if err != nil {
@@ -336,7 +342,7 @@ func RunSink(ctx context.Context, sourcePairURL string, providedCode Code, local
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := httpserver.Client(httpserver.PairClient).Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("POST %s: %w", sourcePairURL, err)
 	}

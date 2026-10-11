@@ -162,6 +162,23 @@ Replace:
 - `your-mac.tailnet` with your Mac's Tailscale hostname (`tailscale status` on either machine)
 - The pairing code and URL with the values printed by the Mac source wizard
 
+### Linux teammate agents (pull from the laptop)
+
+An agent the laptop lists as a teammate does not use the setup above. It pulls from the laptop, so it needs no listener and no inbound access:
+
+```bash
+# Install the pinned release (the laptop's pairing notice carries the tag and SHA256)
+bash teammate-install.sh v1.2.3 <sha256>
+
+# One-time setup, with the values from the notice
+~/.local/bin/agentcookie join --from your-mac.tailnet.ts.net --code ABCD-EFGH-IJKL --as grokbot
+
+# At the start of every turn
+~/.local/bin/agentcookie sink --pull-once
+```
+
+`join` writes a pull-mode `sink.yaml` (no `listen.addr`), a sync-all `blocklist.yaml` if none exists, pairs, and pulls once. The proxy comes from `--proxy` or the `proxy` saved in the agent's Tincan `client.json`. `--pull-once` exits 0 when cookies are current, 3 when the laptop is unreachable (retry before the first logged-in action), and 4 when the machine needs to re-pair. With `--cadence turn+timer` it also keeps one background loop pulling every 5 to 15 minutes. The tailnet ACL must let the agent's tag reach `<laptop>:9998`.
+
 ### Linux CDP source (existing browser; no SQLite access)
 
 When the authenticated browser already runs on Linux, set `cdp_source` in its

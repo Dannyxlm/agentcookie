@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,9 +47,15 @@ func Execute() {
 	rootCmd.PersistentFlags().StringVar(&common.ConfigDir, "config-dir", defaultConfigDir(), "directory holding source.yaml, sink.yaml, blocklist.yaml")
 	rootCmd.PersistentFlags().BoolVar(&common.JSON, "json", false, "emit machine-readable JSON output where the subcommand supports it")
 
-	rootCmd.AddCommand(sourceCmd, sinkCmd, pairCmd, teammatesCmd, statusCmd, versionCmd, wizardCmd, doctorCmd, secretCmd, discoverCmd, cookiesCmd, accountsCmd, cmuxSyncCmd, agentSyncCmd, exportCmd)
+	rootCmd.AddCommand(sourceCmd, sinkCmd, pairCmd, teammatesCmd, statusCmd, versionCmd, wizardCmd, doctorCmd, secretCmd, discoverCmd, cookiesCmd, accountsCmd, cmuxSyncCmd, agentSyncCmd, exportCmd, joinCmd)
 
 	if err := rootCmd.Execute(); err != nil {
+		if ec, ok := errors.AsType[*exitCodeError](err); ok {
+			if ec.err != nil {
+				fmt.Fprintln(os.Stderr, "agentcookie:", ec.err)
+			}
+			os.Exit(ec.code)
+		}
 		// Cobra already prints usage on flag errors; surface RunE errors here.
 		if !cobraReportedError(err) {
 			fmt.Fprintln(os.Stderr, "agentcookie:", err)
@@ -56,6 +63,23 @@ func Execute() {
 		os.Exit(1)
 	}
 }
+
+// exitCodeError makes the process exit with code. err, when set, is
+// printed first. Commands with documented exit codes (sink --pull-once)
+// return it.
+type exitCodeError struct {
+	code int
+	err  error
+}
+
+func (e *exitCodeError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+func (e *exitCodeError) Unwrap() error { return e.err }
 
 func defaultConfigDir() string {
 	home, err := os.UserHomeDir()
