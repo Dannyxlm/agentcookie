@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -50,6 +51,7 @@ func TestCmuxSurfaceFollowsLoadedConfig(t *testing.T) {
 // reloaded sink.yaml changes delivery on the next pull.
 func TestApplySealedEnvelope_CmuxFollowsConfigReload(t *testing.T) {
 	f := newSinkHandlerFixture(t, false)
+	permissivePolicy(t, f)
 	t.Cleanup(sinkpush.SetRegistryForTesting([]sinkpush.Adapter{&recordingAdapter{installed: true}}))
 	cookies := []chrome.Cookie{{HostKey: ".example.com", Name: "sess", Value: "v", Path: "/"}}
 
@@ -79,6 +81,13 @@ func TestApplySealedEnvelope_CmuxFollowsConfigReload(t *testing.T) {
 	}
 }
 
+// permissivePolicy writes an explicit blocklist policy so the test cookie
+// reaches adapters on Linux too, where a missing policy ships nothing.
+func permissivePolicy(t *testing.T, f *sinkHandlerFixture) {
+	t.Helper()
+	writeCLIFile(t, filepath.Join(f.configDir, "blocklist.yaml"), "version: 1\npolicy: blocklist\ndomains: []\n")
+}
+
 type ctxKey struct{}
 
 // ctxSeeingAdapter records whether PushContext saw the caller's context.
@@ -98,6 +107,7 @@ func (a *ctxSeeingAdapter) PushContext(ctx context.Context, _ []chrome.Cookie) e
 // bounds with its budget.
 func TestApplySealedEnvelope_AdaptersGetCallerContext(t *testing.T) {
 	f := newSinkHandlerFixture(t, false)
+	permissivePolicy(t, f)
 	a := &ctxSeeingAdapter{}
 	t.Cleanup(sinkpush.SetRegistryForTesting([]sinkpush.Adapter{a}))
 	payload, err := json.Marshal(protocol.SyncEnvelope{
