@@ -442,3 +442,39 @@ func TestStepRemoved(t *testing.T) {
 		t.Fatalf("phase = %q", s.Rec.Phase)
 	}
 }
+
+// The lifecycle re-mints an expired code right after the teammate polls,
+// which overwrites the notice it picked up. A notice the teammate picked
+// up (relay poll after it) whose code expired with no /pair attempt is
+// kept as PairCodeMissedAt so doctor can still blame the tailnet ACL.
+func TestStepRemintKeepsMissedCode(t *testing.T) {
+	expires := stepT0.Add(pairCodeTTL)
+	remint := func(s tmState) tmState {
+		s.Mem.CodeLive = false
+		a := nodeAgent("nGROK", "grok-bot")
+		a.LastPoll = stepT0.Add(5 * time.Minute)
+		s, acts := mustStep(t, s, rosterEv(a), stepT0.Add(40*time.Minute))
+		wantActs(t, acts, actCancelNotify, actPairingNotify)
+		s, _ = mustStep(t, s, tmEvent{Kind: evNotifyResult, Purpose: state.NotifyPurposePairing,
+			Result: tincan.SendResult{Outcome: tincan.OutcomeSent, RequestID: "r-2"}, CodeExpires: stepT0.Add(70 * time.Minute)}, stepT0.Add(40*time.Minute))
+		return s
+	}
+
+	s := remint(pairingState())
+	if !s.Rec.PairCodeMissedAt.Equal(expires) {
+		t.Fatalf("pair_code_missed_at = %v, want the old code's expiry %v", s.Rec.PairCodeMissedAt, expires)
+	}
+
+	// A /pair attempt with the old code means the laptop was reachable.
+	tried := pairingState()
+	tried.Rec.LastPairAttemptAt = stepT0.Add(6 * time.Minute)
+	if s := remint(tried); !s.Rec.PairCodeMissedAt.IsZero() {
+		t.Fatalf("an attempted code is not missed: %v", s.Rec.PairCodeMissedAt)
+	}
+
+	// Pairing clears it.
+	s, _ = mustStep(t, s, tmEvent{Kind: evPaired, NodeID: "nGROK"}, stepT0.Add(45*time.Minute))
+	if !s.Rec.PairCodeMissedAt.IsZero() {
+		t.Fatal("paired must clear pair_code_missed_at")
+	}
+}

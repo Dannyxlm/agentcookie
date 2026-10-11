@@ -148,7 +148,7 @@ func stepTeammate(s tmState, ev tmEvent, now time.Time) (tmState, []tmAction, er
 		unbind(r)
 		clearPending(r)
 		r.ReplacesNodeID, r.ReplacesNodeName = "", ""
-		r.CodeExpiresAt = time.Time{}
+		r.CodeExpiresAt, r.PairCodeMissedAt = time.Time{}, time.Time{}
 		s.Mem = tmMem{}
 		return s, acts, nil
 	}
@@ -177,6 +177,7 @@ func stepTeammate(s tmState, ev tmEvent, now time.Time) (tmState, []tmAction, er
 			break
 		}
 		r.Phase = state.PhasePaired
+		r.PairCodeMissedAt = time.Time{}
 		if r.NotifyPurpose == state.NotifyPurposePairing {
 			acts = append(acts, cancelOpenNotify(r)...)
 		}
@@ -310,6 +311,7 @@ func stepApprove(s tmState, ev tmEvent, now time.Time) (tmState, []tmAction, err
 	r.ReplacesNodeID, r.ReplacesNodeName = "", ""
 	r.Phase = state.PhasePairing
 	r.NotifyStatus, r.NotifyError, r.NotifySentAt = "", "", time.Time{}
+	r.PairCodeMissedAt = time.Time{}
 	s.Mem = tmMem{}
 	acts = append(acts, pairingNotify(r)...)
 	return s, acts, nil
@@ -317,6 +319,11 @@ func stepApprove(s tmState, ev tmEvent, now time.Time) (tmState, []tmAction, err
 
 func stepNotifyResult(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time) {
 	res := ev.Result
+	if ev.Purpose == state.NotifyPurposePairing && pairNoticeUnanswered(*r, now) {
+		// This notice replaces one the teammate picked up and never
+		// answered; keep that evidence for doctor's ACL diagnosis.
+		r.PairCodeMissedAt = r.CodeExpiresAt
+	}
 	r.NotifyPurpose = ev.Purpose
 	r.NotifyStatus = string(res.Outcome)
 	switch res.Outcome {
@@ -377,6 +384,17 @@ func stepHoldStatus(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time
 		r.Phase = state.PhasePairing
 		return pairingNotify(r)
 	}
+}
+
+// pairNoticeUnanswered reports whether r's pairing notice reached the
+// teammate (the roster shows it polled the relay after the notice was
+// sent) and its code expired with no /pair attempt after the notice. A
+// teammate that read its notice but never reached the laptop's /pair is
+// most likely blocked by the tailnet ACL.
+func pairNoticeUnanswered(r state.TeammateRecord, now time.Time) bool {
+	return r.NotifyPurpose == state.NotifyPurposePairing && r.NotifyStatus == state.NotifySent &&
+		!r.NotifySentAt.IsZero() && !r.CodeExpiresAt.IsZero() && !now.Before(r.CodeExpiresAt) &&
+		r.RelaySeenAt.After(r.NotifySentAt) && !r.LastPairAttemptAt.After(r.NotifySentAt)
 }
 
 // pairingNotify cancels the open notify, then asks for a fresh code and

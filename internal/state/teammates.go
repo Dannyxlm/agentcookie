@@ -128,6 +128,14 @@ type TeammateRecord struct {
 	NotifyError   string    `json:"notify_error,omitempty"`
 	// CodeExpiresAt is when the code in the last pairing notice expires.
 	CodeExpiresAt time.Time `json:"code_expires_at,omitzero"`
+	// LastPairAttemptAt is the last /pair request that carried this
+	// teammate's pending code, whether it paired or was refused.
+	LastPairAttemptAt time.Time `json:"last_pair_attempt_at,omitzero"`
+	// PairCodeMissedAt is the expiry of a pairing code whose notice the
+	// teammate picked up (it polled the relay after the notice) but never
+	// answered with a /pair. It survives the re-mint that replaces that
+	// notice, so doctor can still name a missing tailnet ACL rule.
+	PairCodeMissedAt time.Time `json:"pair_code_missed_at,omitzero"`
 	// LastRepairAt is the last automatic re-pair after a lost key.
 	LastRepairAt time.Time `json:"last_repair_at,omitzero"`
 	// StaleNotifiedAt is the last staleness notice.

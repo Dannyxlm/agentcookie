@@ -37,6 +37,14 @@
 - For cadence `turn+timer`, `--pull-once` also starts one detached background pull loop if none is running (pidfile `~/.agentcookie/pull-loop.pid`, held locked for the loop's life, log in `~/.agentcookie/pull-loop.log`). The loop pulls every 5 to 15 minutes, jittered, and each pull takes `pull.lock`. A killed loop is restarted by the next turn.
 - New `scripts/teammate-install.sh <tag> <sha256>` installs the Linux release binary into `~/.local/bin`. It accepts only an exact release tag (not `latest` or a branch), checks the asset against the SHA256 the laptop pins (never a `checksums.txt` from the same release), and replaces the binary atomically.
 
+### Teammates: doctor, status, and docs
+
+- `agentcookie doctor` gains a teammates section when `teammates.yaml` exists: the pull listener (FAIL when down or not running), the `teammates.yaml` parse error (FAIL), a missing `tincan` or a roster without Tailscale nodes (WARN, fixed by `agentcookie teammates setup`), and one line per teammate with its state, machine, and last pull. A held notice, a machine waiting for approval, and a paired teammate with no pull for over 6 hours are WARN.
+- Doctor blames the tailnet ACL only when a teammate polled the relay after its pairing notice and the code expired with no `/pair` attempt, and then prints the exact rule, for example `tag:grokbot -> your-mac.tail-xxxx.ts.net:9998`, using the node's Tailscale tag (or its node name when it has none). A code that expired before the teammate polled is reported as "has not picked up its pairing notice".
+- The laptop records each teammate's last `/pair` attempt (`last_pair_attempt_at`, success or refusal) and keeps a picked-up but unanswered code as `pair_code_missed_at` across the automatic re-send, so the ACL diagnosis survives the next notice.
+- `agentcookie status` (and `status --json`) shows a compact teammates block with the same diagnosis.
+- New [docs/teammates.md](docs/teammates.md): setup, listing, the approval dialog, the standing line, Linux teammate details, rebuilds and lost keys, removal, and security notes.
+
 ### Keychain: --recreate keeps existing Chrome cookies readable
 
 - `agentcookie wizard set-keychain-access --recreate` deleted Chrome Safe Storage and re-added it with a random value, so every existing Chrome cookie on that Mac became unreadable. The same step also ran after `--any-app`'s guard refused to touch an unreadable item, which bypassed that guard. The step now recreates an existing item with its own value, refuses to delete an item whose value it cannot read, and uses a fresh value only when no item exists yet.

@@ -53,7 +53,8 @@ func (p *pendingPairings) open(now time.Time) bool {
 }
 
 // match finds the pending entry whose code equals c (constant-time per
-// entry). An expired match is removed and reported as expired.
+// entry). An expired match is removed and reported as expired; its Name
+// is still set so the attempt can be recorded.
 func (p *pendingPairings) match(c pairing.Code, now time.Time) (pendingPair, bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -61,7 +62,7 @@ func (p *pendingPairings) match(c pairing.Code, now time.Time) (pendingPair, boo
 		if e.code.Equal(c) {
 			if !now.Before(e.Expires) {
 				delete(p.byName, name)
-				return pendingPair{}, false, true
+				return pendingPair{PendingPairing: PendingPairing{Name: name}}, false, true
 			}
 			return *e, true, false
 		}
@@ -139,6 +140,19 @@ func (h *teammateHub) PendingPairings() []PendingPairing {
 	return out
 }
 
+// recordPairAttempt notes that a /pair carrying name's pending code reached
+// the route. Doctor uses it to tell a blocked tailnet ACL (the teammate
+// picked up its notice but never reached /pair) from other failures.
+func (h *teammateHub) recordPairAttempt(name string) {
+	now := h.now().UTC()
+	if err := h.store.Update(func(st *state.TeammatesState) error {
+		st.Teammate(name).LastPairAttemptAt = now
+		return nil
+	}); err != nil {
+		fmt.Fprintf(h.log, "agentcookie source: teammates: %v\n", err)
+	}
+}
+
 // pairHandler serves POST /pair on the daemon's 9998 server (KTD7). It is
 // a 404 unless a pairing is pending. A code is accepted only from the
 // node it was minted for (WhoIs StableID), and the key is filed as
@@ -151,6 +165,9 @@ func (h *teammateHub) pairHandler(localHostname string) http.Handler {
 				return "", "", &pairing.PairError{Status: http.StatusServiceUnavailable, Msg: "teammate pairing is suspended until teammates.yaml loads"}
 			}
 			p, ok, expired := h.pairings.match(pairing.Code(req.Code), h.now())
+			if ok || expired {
+				h.recordPairAttempt(p.Name)
+			}
 			if expired {
 				return "", "", &pairing.PairError{Status: http.StatusUnauthorized, Msg: "pairing code expired"}
 			}

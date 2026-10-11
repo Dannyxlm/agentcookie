@@ -249,3 +249,52 @@ func (c *testClock) Advance(d time.Duration) {
 	defer c.mu.Unlock()
 	c.t = c.t.Add(d)
 }
+
+// Doctor's ACL diagnosis needs to know whether a teammate's /pair ever
+// reached the laptop: every attempt with a teammate's pending code is
+// recorded, success or failure; a code that matches nobody records nothing.
+func TestPairRouteRecordsAttempts(t *testing.T) {
+	f := newPairFixture(t, otherNode)
+	clock := newTestClock()
+	f.hub.now = clock.Now
+	code, _, err := f.hub.MintPairing("grokbot", grokNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.postStatus(t, []byte(`{"protocol_version":1,"code":"WRON-GCOD-EXXX"}`))
+	for _, name := range []string{"grokbot", "instinct"} {
+		if rec, _ := f.hub.store.Record(name); !rec.LastPairAttemptAt.IsZero() {
+			t.Fatalf("%s: a code matching no pairing must not record an attempt", name)
+		}
+	}
+
+	// Refused (wrong node) still counts: the request reached the route.
+	clock.Advance(time.Minute)
+	failedAt := clock.Now()
+	if _, err := f.runSink(code); err == nil {
+		t.Fatal("wrong node should be refused")
+	}
+	rec, _ := f.hub.store.Record("grokbot")
+	if !rec.LastPairAttemptAt.Equal(failedAt.UTC()) {
+		t.Fatalf("refused attempt: last_pair_attempt_at = %v, want %v", rec.LastPairAttemptAt, failedAt)
+	}
+
+	// Success records too.
+	f.whois.mu.Lock()
+	f.whois.nodes[loopbackIP] = grokNode
+	f.whois.mu.Unlock()
+	f.hub.whois.clear()
+	clock.Advance(time.Minute)
+	okAt := clock.Now()
+	if _, err := f.runSink(code); err != nil {
+		t.Fatalf("bound node: %v", err)
+	}
+	rec, _ = f.hub.store.Record("grokbot")
+	if !rec.LastPairAttemptAt.Equal(okAt.UTC()) {
+		t.Fatalf("successful attempt: last_pair_attempt_at = %v, want %v", rec.LastPairAttemptAt, okAt)
+	}
+	if rec, _ := f.hub.store.Record("instinct"); !rec.LastPairAttemptAt.IsZero() {
+		t.Fatal("another teammate's record must not change")
+	}
+}

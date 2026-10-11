@@ -162,6 +162,10 @@ Replace:
 - `your-mac.tailnet` with your Mac's Tailscale hostname (`tailscale status` on either machine)
 - The pairing code and URL with the values printed by the Mac source wizard
 
+### Teammates: your Tincan agents pull from the laptop
+
+List your own Agent Tincan agents by name in `~/.config/agentcookie/teammates.yaml` on the laptop, approve each agent's machine once in a dialog, and give each agent one standing line. The agent then pulls fresh cookies at the start of every turn (and every 5 to 15 minutes if it is always on) over Tailscale, never through the Tincan relay. Only the Tailscale node you approved can pair or pull. Start with `agentcookie teammates setup`; `agentcookie doctor` shows each teammate's state and names a missing tailnet ACL rule. The full guide is [docs/teammates.md](docs/teammates.md).
+
 ### Linux teammate agents (pull from the laptop)
 
 An agent the laptop lists as a teammate does not use the setup above. It pulls from the laptop, so it needs no listener and no inbound access:
@@ -416,6 +420,7 @@ The secrets bus (bearer tokens, API keys, OAuth refresh tokens) is untouched by 
 | [Protocol v1](docs/protocol.md) | wire format spec for future client implementations |
 | [Threat model](docs/threat-model.md) | what agentcookie does and does not protect against |
 | [FAQ](docs/faq.md) | common questions |
+| [Teammates](docs/teammates.md) | Tincan agents that pull cookies from the laptop: setup, approval, rebuilds, removal |
 | [Consumption](docs/consumption.md) | how tools read synced cookies and secrets on the sink |
 | [agent-sync runbook](docs/runbook-agent-sync.md) | browserUse / agent-browser via live CDP injection |
 | [Secrets bus v2 adoption spec](docs/spec-agentcookie-secrets-bus-v2-adoption.md) | `agentcookie.toml` manifest format |

@@ -125,6 +125,9 @@ type TeammateStatus struct {
 	NotifySentAt  time.Time `json:"notify_sent_at,omitzero"`
 	NotifyError   string    `json:"notify_error,omitempty"`
 	CodeExpiresAt time.Time `json:"code_expires_at,omitzero"`
+
+	LastPairAttemptAt time.Time `json:"last_pair_attempt_at,omitzero"`
+	PairCodeMissedAt  time.Time `json:"pair_code_missed_at,omitzero"`
 }
 
 // TeammateStatuses reads teammates.yaml and teammates-state.json (read
@@ -192,6 +195,7 @@ func teammateStatusRow(name string, listed bool, rec state.TeammateRecord) Teamm
 		RelaySeenAt: rec.RelaySeenAt,
 		NotifyID:    rec.NotifyID, NotifyPurpose: rec.NotifyPurpose, NotifyStatus: rec.NotifyStatus,
 		NotifySentAt: rec.NotifySentAt, NotifyError: rec.NotifyError, CodeExpiresAt: rec.CodeExpiresAt,
+		LastPairAttemptAt: rec.LastPairAttemptAt, PairCodeMissedAt: rec.PairCodeMissedAt,
 	}
 }
 
