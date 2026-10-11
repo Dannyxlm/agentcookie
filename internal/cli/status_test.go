@@ -156,3 +156,28 @@ func TestStatusTeammatesBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestSinkSkipStatusLines(t *testing.T) {
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	if lines := sinkSkipStatusLines(state.SinkPushState{URL: "http://a.test/sync", TotalPushes: 2}, now); len(lines) != 0 {
+		t.Fatalf("healthy sink should add no lines, got %q", lines)
+	}
+
+	asleep := state.SinkPushState{Asleep: true, LastAsleepAt: now.Add(-90 * time.Second)}
+	lines := sinkSkipStatusLines(asleep, now)
+	if len(lines) != 1 || !strings.Contains(lines[0], "asleep") || !strings.Contains(lines[0], "1m30s ago") {
+		t.Fatalf("asleep sink should explain the skip, got %q", lines)
+	}
+
+	backoff := state.SinkPushState{ConsecutiveFailures: 3, BackoffUntil: now.Add(2 * time.Minute)}
+	lines = sinkSkipStatusLines(backoff, now)
+	if len(lines) != 1 || !strings.Contains(lines[0], "3 consecutive failure(s)") || !strings.Contains(lines[0], "next retry in 2m0s") {
+		t.Fatalf("backing-off sink should show the next retry, got %q", lines)
+	}
+
+	expired := state.SinkPushState{ConsecutiveFailures: 3, BackoffUntil: now.Add(-time.Second)}
+	if lines := sinkSkipStatusLines(expired, now); len(lines) != 0 {
+		t.Fatalf("an elapsed backoff window should add no lines, got %q", lines)
+	}
+}

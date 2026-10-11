@@ -1,6 +1,7 @@
 package tsclient
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -363,5 +364,55 @@ func TestStatus_PeerByStableIDCarriesTags(t *testing.T) {
 	}
 	if st.PeerByStableID("nNONE") != nil || st.PeerByStableID("") != nil {
 		t.Fatal("unknown or empty StableID must match nothing")
+	}
+}
+
+func TestIsTailscaleIP(t *testing.T) {
+	cases := map[string]bool{
+		"100.64.0.1":         true,
+		"100.127.255.254":    true,
+		"100.63.255.255":     false,
+		"100.128.0.1":        false,
+		"192.168.1.1":        false,
+		"fd7a:115c:a1e0::1":  true,
+		"fd7a:115c:a1e1::1":  false,
+		"::ffff:100.100.1.1": true,
+		"grok-bot":           false,
+		"":                   false,
+	}
+	for in, want := range cases {
+		if got := IsTailscaleIP(in); got != want {
+			t.Errorf("IsTailscaleIP(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestPeerByIP(t *testing.T) {
+	st := &Status{Peer: map[string]*PeerStatus{
+		"a": {HostName: "a", TailscaleIPs: []string{"100.101.102.103", "fd7a:115c:a1e0::abcd"}},
+		"b": {HostName: "b", TailscaleIPs: []string{"100.87.49.2"}},
+	}}
+	if p := st.PeerByIP("100.87.49.2"); p == nil || p.HostName != "b" {
+		t.Errorf("IPv4 lookup = %+v, want b", p)
+	}
+	if p := st.PeerByIP("fd7a:115c:a1e0:0::abcd"); p == nil || p.HostName != "a" {
+		t.Errorf("IPv6 lookup = %+v, want a", p)
+	}
+	if p := st.PeerByIP("100.64.0.9"); p != nil {
+		t.Errorf("unknown IP = %+v, want nil", p)
+	}
+	var nilStatus *Status
+	if p := nilStatus.PeerByIP("100.87.49.2"); p != nil {
+		t.Errorf("nil status = %+v, want nil", p)
+	}
+}
+
+func TestCurrentStatusUsesSeam(t *testing.T) {
+	want := &Status{Version: "test"}
+	restore := SetStatusForTesting(func(context.Context) (*Status, error) { return want, nil })
+	defer restore()
+	got, err := CurrentStatus(context.Background())
+	if err != nil || got != want {
+		t.Fatalf("CurrentStatus = %v, %v", got, err)
 	}
 }
