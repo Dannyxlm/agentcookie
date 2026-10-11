@@ -169,7 +169,7 @@ func TestLifecycleFirstSightingApprovalAndPairingNotice(t *testing.T) {
 	text := call.Args[len(call.Args)-1]
 	for _, want := range []string{
 		"https://raw.githubusercontent.com/mvanhorn/agentcookie/v1.4.0/scripts/teammate-install.sh",
-		"--tag v1.4.0 --sha256 ab12" + strings.Repeat("0", 60),
+		"| bash -s -- v1.4.0 ab12" + strings.Repeat("0", 60),
 		"join --from mac-laptop.tail2b6977.ts.net --code ",
 		"--as grokbot --cadence turn+timer",
 		teammateStandingLine(),

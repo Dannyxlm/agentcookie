@@ -32,7 +32,7 @@ func teammateStandingLine() string {
 // Linux asset against sha256, which the laptop computed itself, so the
 // teammate never trusts a checksum from the same channel as the binary.
 func teammateInstallLine(tag, sha string) string {
-	return fmt.Sprintf("curl -fsSL https://raw.githubusercontent.com/%s/%s/scripts/teammate-install.sh | sh -s -- --tag %s --sha256 %s",
+	return fmt.Sprintf("curl -fsSL https://raw.githubusercontent.com/%s/%s/scripts/teammate-install.sh | bash -s -- %s %s",
 		teammateRepo, tag, tag, sha)
 }
 
