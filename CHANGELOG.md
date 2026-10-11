@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Installer re-runs upgrade in place
+
+- Re-running `scripts/install-beta.sh` on a healthy, configured role no longer re-runs the wizard. It installs the new binary, restarts that role's LaunchAgent on it with `launchctl kickstart -k`, confirms it is running, prints `doctor`, and exits 0. A doctor FAIL, an unloaded daemon, a LaunchAgent that runs a different binary path, or a failed restart runs the wizard instead.
+- The binary is written to a temp file beside the target and renamed into place, so the restarted daemon gets a fresh inode instead of a binary overwritten while running.
+- `--code`, `--pair-url` and a `--peer` matching the configured peer no longer force the wizard, so the documented sink command can be re-run as is. `--skip-chrome-sqlite`, `--write-chrome-sqlite`, `--no-cdp`, an explicit `--skip-keychain-prompt` and a different `--peer` still do. The `--skip-keychain-prompt` the installer adds on its own without a TTY does not.
+- New `--repair` flag forces a fresh pairing handshake. The healthy-path message names it.
+- `--extra-binary` no longer breaks the install by passing an unknown flag to `wizard install`. The installer makes no Keychain change for it and prints the manual `agentcookie wizard set-keychain-access --recreate --extra-binary <path>` command, noting that CLIs signed by the same Developer ID team as agentcookie are already covered by the default partition list.
+- Credits: @chronicgiardia wrote the original idempotency guard and the role-mismatch test (#132, #134).
+
 ### Signed binaries can quit Chrome through Apple Events
 
 - Signed release and `make install` binaries now carry the `com.apple.security.automation.apple-events` entitlement. Hardened Runtime blocked chromectl's AppleScript quit without it, and the Google Chrome toggle under Privacy & Security > Automation could not be turned on. `scripts/sign.sh` fails with exit 3 unless the signed binary has the key set to true.

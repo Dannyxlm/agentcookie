@@ -301,6 +301,325 @@ if ! grep -q 'bash scripts/release_asset_test.sh' "$ROOT/Makefile"; then
   fail "make test does not run scripts/release_asset_test.sh"
 fi
 
+# --- wizard_skip_candidate ---
+# The installer may only consider skipping the wizard when the requested
+# role is already configured and no wizard-forcing argument was passed.
+cfg="$(mktemp -d)"
+flow="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$cfg" "$flow"' EXIT
+
+assert_eq "$(role_config_path source "$cfg")" "$cfg/source.yaml" "source config path"
+assert_eq "$(role_config_path sink "$cfg")" "$cfg/sink.yaml" "sink config path"
+
+# Nothing configured yet: a first install must always run the wizard.
+if wizard_skip_candidate source "$cfg" 0; then
+  fail "unconfigured source must run the wizard"
+fi
+if wizard_skip_candidate sink "$cfg" 0; then
+  fail "unconfigured sink must run the wizard"
+fi
+
+printf 'peer:\n  hostname: example\n' > "$cfg/source.yaml"
+
+# Configured role, no forcing args: eligible for the health check.
+if ! wizard_skip_candidate source "$cfg" 0; then
+  fail "configured source with no forcing args should be a skip candidate"
+fi
+
+# The role-mismatch case this guard exists for. doctor exits 0 on a
+# healthy source-only box because every sink check is SKIPPED, not FAIL.
+# Asking for a sink there must still run the wizard.
+if wizard_skip_candidate sink "$cfg" 0; then
+  fail "source config must not satisfy an --as sink install"
+fi
+
+# Wizard-forcing arguments always run the wizard.
+if wizard_skip_candidate source "$cfg" 1; then
+  fail "forcing args must force the wizard to run"
+fi
+
+# A role the script never accepts is never a skip candidate.
+printf 'x\n' > "$cfg/bogus.yaml"
+if wizard_skip_candidate bogus "$cfg" 0; then
+  fail "unknown role must not be a skip candidate"
+fi
+
+# --- role_peer_hostnames / plist_program_path ---
+assert_eq "$(role_peer_hostnames "$cfg/source.yaml")" "example" "peer hostname from source.yaml"
+cat > "$cfg/sink.yaml" <<'YAML'
+listen:
+  addr: 0.0.0.0:9999
+sinks:
+  - url: http://other:9999/sync
+    peer: not-this-one
+peer:
+  hostname: "mac-mini" # quoted, with a comment
+skip_chrome_sqlite: true
+YAML
+assert_eq "$(role_peer_hostnames "$cfg/sink.yaml" | tr '\n' ' ')" "not-this-one mac-mini " "peer hostnames include sinks[].peer and peer.hostname"
+cat > "$cfg/multi.yaml" <<'YAML'
+sinks:
+  - url: http://mini:9999/sync
+    peer: mac-mini
+  - peer: 'studio' # second sink
+    url: http://studio:9999/sync
+cdp_source:
+  enabled: false
+YAML
+assert_eq "$(role_peer_hostnames "$cfg/multi.yaml" | tr '\n' ' ')" "mac-mini studio " "peer hostnames from a multi-sink source.yaml"
+assert_eq "$(role_peer_hostnames "$cfg/missing.yaml")" "" "missing config has no peer"
+
+# --- installer re-run flow ---
+# Each scenario runs the real script end to end against a stub tarball,
+# a scratch HOME and bin dir, and stub tailscale, codesign, xattr,
+# launchctl and sleep on PATH. Real launchctl is never reached.
+stubs="$flow/stubs"
+mkdir -p "$stubs" "$flow/pkg/agentcookie_0.0.0_darwin_universal"
+for tool in tailscale codesign xattr sleep; do
+  printf '#!/usr/bin/env bash\nexit %s\n' "$([[ $tool == codesign ]] && echo 1 || echo 0)" > "$stubs/$tool"
+done
+cat > "$stubs/launchctl" <<'STUB'
+#!/usr/bin/env bash
+echo "launchctl $*" >> "$STUB_LOG"
+case "$1" in
+  print)
+    [[ "${STUB_LC_LOADED:-1}" == "1" ]] || exit 113
+    printf '%s = {\n\tstate = %s\n' "$2" "${STUB_LC_STATE:-running}"
+    [[ -z "${STUB_LC_PROGRAM:-}" ]] || printf '\tprogram = %s\n' "$STUB_LC_PROGRAM"
+    printf '}\n'
+    ;;
+  kickstart) exit "${STUB_LC_KICK_EXIT:-0}" ;;
+esac
+STUB
+cat > "$flow/pkg/agentcookie_0.0.0_darwin_universal/agentcookie" <<'STUB'
+#!/usr/bin/env bash
+echo "agentcookie $*" >> "$STUB_LOG"
+case "$1 ${2:-}" in
+  "doctor ")
+    echo "stub doctor output"
+    exit "${STUB_DOCTOR_EXIT:-0}" ;;
+  "wizard install")
+    for a in "$@"; do
+      if [[ "$a" == "--extra-binary" ]]; then
+        echo "unknown flag: --extra-binary" >&2
+        exit 64
+      fi
+    done ;;
+esac
+exit 0
+STUB
+chmod +x "$stubs"/* "$flow/pkg/agentcookie_0.0.0_darwin_universal/agentcookie"
+tar -czf "$flow/ac.tar.gz" -C "$flow/pkg" .
+uid="$(id -u)"
+
+# new_box NAME ROLE... : a scratch Mac where each ROLE is configured with
+# peer hostname "peerhost" and a LaunchAgent plist that runs bin/agentcookie.
+new_box() {
+  local name="$1" r
+  shift
+  box="$flow/$name"
+  mkdir -p "$box/home/.config/agentcookie" "$box/home/Library/LaunchAgents" "$box/bin"
+  : > "$box/calls.log"
+  for r in "$@"; do
+    printf 'peer:\n  hostname: peerhost\n' > "$box/home/.config/agentcookie/$r.yaml"
+    write_plist "$r" "$box/bin/agentcookie"
+  done
+}
+
+write_plist() {
+  local r="$1" program="$2"
+  cat > "$box/home/Library/LaunchAgents/dev.agentcookie.$r.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.agentcookie.$r</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>$program</string>
+    <string>$r</string>
+  </array>
+</dict>
+</plist>
+PLIST
+}
+
+# run_installer ARGS... : runs install-beta.sh in $box with no TTY.
+# Sets run_exit; output lands in $box/out, calls in $box/calls.log.
+run_installer() {
+  run_exit=0
+  env -u AGENTCOOKIE_INSTALL_BETA_LIB_ONLY \
+    HOME="$box/home" PATH="$stubs:$PATH" STUB_LOG="$box/calls.log" \
+    bash "$ROOT/scripts/install-beta.sh" --tarball "$flow/ac.tar.gz" --bin-dir "$box/bin" "$@" \
+    < /dev/null > "$box/out" 2>&1 || run_exit=$?
+}
+
+called() { grep -qF -- "$1" "$box/calls.log"; }
+said() { grep -qF -- "$1" "$box/out"; }
+wizard_ran() { grep -q '^agentcookie wizard install' "$box/calls.log"; }
+# guard_ran_doctor: doctor was called before the wizard (the final doctor
+# after the wizard does not count).
+guard_ran_doctor() {
+  awk '/^agentcookie wizard install/ {exit} /^agentcookie doctor/ {found=1} END {exit !found}' "$box/calls.log"
+}
+
+expect_healthy() {
+  local label="$1" r="$2"
+  assert_eq "$run_exit" "0" "$label: exit code"
+  if wizard_ran; then fail "$label: wizard must not run"; fi
+  if ! called "launchctl kickstart -k gui/$uid/dev.agentcookie.$r"; then
+    fail "$label: expected kickstart -k gui/$uid/dev.agentcookie.$r"
+  fi
+  if ! said "stub doctor output"; then fail "$label: doctor output not reported"; fi
+}
+
+expect_wizard() {
+  local label="$1"
+  if ! wizard_ran; then fail "$label: wizard must run"; cat "$box/out" >&2; fi
+}
+
+# healthy configured source upgrades in place without the wizard.
+new_box healthy source
+run_installer --as source
+expect_healthy "healthy source" source
+if ! said "--repair"; then fail "healthy path hint must name --repair"; fi
+if called "launchctl kickstart" && ! grep -q 'launchctl print' "$box/calls.log"; then
+  fail "healthy source: loaded check must run before kickstart"
+fi
+
+# doctor FAIL falls through to the wizard, before any restart.
+new_box doctorfail source
+STUB_DOCTOR_EXIT=1 run_installer --as source --peer peerhost
+expect_wizard "doctor fail"
+if called "launchctl kickstart"; then fail "doctor fail: must not restart the daemon"; fi
+
+# LaunchAgent not loaded.
+new_box notloaded source
+STUB_LC_LOADED=0 run_installer --as source --peer peerhost
+expect_wizard "agent not loaded"
+if called "launchctl kickstart"; then fail "agent not loaded: must not kickstart"; fi
+
+# plist runs a different binary path (also how a --bin-dir change shows up).
+new_box otherpath source
+write_plist source "/somewhere/else/agentcookie"
+run_installer --as source --peer peerhost
+expect_wizard "plist path mismatch"
+if called "launchctl kickstart"; then fail "plist path mismatch: must not kickstart"; fi
+
+# launchd still holds a job definition for another binary than the plist.
+new_box staleloaded source
+STUB_LC_PROGRAM="/old/agentcookie" run_installer --as source --peer peerhost
+expect_wizard "loaded job runs another binary"
+if called "launchctl kickstart"; then fail "loaded job mismatch: must not kickstart"; fi
+
+# The loaded job runs the target: still healthy.
+new_box loadedmatch source
+STUB_LC_PROGRAM="$box/bin/agentcookie" run_installer --as source
+expect_healthy "loaded job runs the target" source
+
+# kickstart fails.
+new_box kickfail source
+STUB_LC_KICK_EXIT=1 run_installer --as source --peer peerhost
+expect_wizard "kickstart fails"
+
+# kickstart succeeds but the agent is not running afterward.
+new_box notrunning source
+STUB_LC_STATE=waiting run_installer --as source --peer peerhost
+expect_wizard "agent not running after restart"
+
+# Role mismatch: --as sink on a source-only box runs the wizard.
+new_box rolemismatch source
+run_installer --as sink --peer peerhost --code AAAA-BBBB-CCCC --pair-url http://peerhost:9998/pair
+expect_wizard "sink on source-only box"
+if guard_ran_doctor; then
+  fail "sink on source-only box: guard must not run doctor"
+fi
+
+# --no-cdp forces the wizard on a configured sink.
+new_box nocdp sink
+run_installer --as sink --peer peerhost --code AAAA-BBBB-CCCC --pair-url http://peerhost:9998/pair --no-cdp
+expect_wizard "--no-cdp"
+if ! called "--no-cdp"; then fail "--no-cdp must be forwarded"; fi
+
+# explicit --skip-keychain-prompt forces the wizard.
+new_box explicitskp sink
+run_installer --as sink --peer peerhost --code AAAA-BBBB-CCCC --pair-url http://peerhost:9998/pair --skip-keychain-prompt
+expect_wizard "explicit --skip-keychain-prompt"
+
+# no TTY on a configured sink (installer adds --skip-keychain-prompt
+# itself on the wizard path) still takes the healthy path.
+new_box notty sink
+run_installer --as sink
+expect_healthy "no-TTY sink" sink
+
+# the documented sink command re-run from history takes the healthy path.
+new_box documented sink
+run_installer --as sink --peer peerhost --code AAAA-BBBB-CCCC --pair-url http://peerhost:9998/pair
+expect_healthy "documented sink re-run" sink
+
+# a multi-sink source re-run with one of its configured sink peers is healthy.
+new_box multisink source
+printf 'sinks:\n  - url: http://peerhost:9999/sync\n    peer: peerhost\n  - url: http://studio:9999/sync\n    peer: studio\n' > "$box/home/.config/agentcookie/source.yaml"
+run_installer --as source --peer studio
+expect_healthy "multi-sink source re-run" source
+
+# a different --peer runs the wizard.
+new_box newpeer source
+run_installer --as source --peer otherhost
+expect_wizard "different --peer"
+if guard_ran_doctor; then
+  fail "different --peer: guard must not run doctor"
+fi
+
+# --repair runs the wizard and forwards --repair.
+new_box repair source
+run_installer --as source --peer peerhost --repair
+expect_wizard "--repair"
+if ! grep -q '^agentcookie wizard install .*--repair' "$box/calls.log"; then
+  fail "--repair must be forwarded to wizard install"
+fi
+
+# --extra-binary on the healthy path prints the manual command only.
+new_box extrahealthy sink
+run_installer --as sink --extra-binary /path/cli
+expect_healthy "--extra-binary healthy" sink
+if ! said "$box/bin/agentcookie wizard set-keychain-access --recreate --extra-binary /path/cli"; then
+  fail "--extra-binary healthy: manual set-keychain-access command not printed"
+fi
+if ! said "Developer ID"; then fail "--extra-binary healthy: Developer ID note missing"; fi
+if called "set-keychain-access"; then fail "--extra-binary healthy: must not run set-keychain-access"; fi
+
+# --extra-binary on the wizard path is not forwarded to wizard install.
+new_box extrawizard sink
+run_installer --as sink --peer peerhost --code AAAA-BBBB-CCCC --pair-url http://peerhost:9998/pair --extra-binary /path/cli --repair
+expect_wizard "--extra-binary wizard"
+assert_eq "$run_exit" "0" "--extra-binary wizard: exit code"
+if ! said "$box/bin/agentcookie wizard set-keychain-access --recreate --extra-binary /path/cli"; then
+  fail "--extra-binary wizard: manual set-keychain-access command not printed"
+fi
+if called "set-keychain-access"; then fail "--extra-binary wizard: must not run set-keychain-access"; fi
+
+# the binary is renamed into place, leaving no temp file behind.
+new_box placement source
+printf 'old\n' > "$box/bin/agentcookie"
+chmod +x "$box/bin/agentcookie"
+# ls -i is the portable inode read (stat flags differ on BSD and GNU).
+# shellcheck disable=SC2012
+old_inode="$(ls -i "$box/bin/agentcookie" | awk '{print $1}')"
+run_installer --as source
+# shellcheck disable=SC2012
+new_inode="$(ls -i "$box/bin/agentcookie" | awk '{print $1}')"
+if [[ "$old_inode" == "$new_inode" ]]; then fail "binary placement must replace the target inode"; fi
+assert_eq "$(ls -A "$box/bin")" "agentcookie" "binary placement leaves no temp file"
+if ! grep -q 'stub doctor' "$box/bin/agentcookie"; then fail "binary placement did not install the new binary"; fi
+
+# First install: no config, the wizard runs and the guard does not run doctor.
+new_box fresh
+run_installer --as source --peer peerhost
+expect_wizard "first install"
+if guard_ran_doctor; then fail "first install: guard must not run doctor"; fi
+
 # Apple Events entitlement (#135). Hardened Runtime blocks chromectl's
 # osascript quit unless the signed binary carries the key with a true
 # value. Plain grep keeps these checks runnable on the Linux CI runner.
