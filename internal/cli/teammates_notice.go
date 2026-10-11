@@ -1,13 +1,9 @@
 package cli
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,10 +27,10 @@ func teammateStandingLine() string {
 // teammateInstallLine is the one-liner that installs or verifies the
 // pinned agentcookie release in ~/.local/bin. It pins one SHA256 per Linux
 // asset (amd64=<sha> arm64=<sha>); the installer checks the asset for the
-// host's arch against its digest, which the laptop computed itself, so the
-// teammate never trusts a checksum from the same channel as the binary.
-// An empty arm64 digest (the release has no arm64 asset) is left out, and
-// the installer then refuses an arm64 host.
+// host's arch against its digest, which is embedded in the laptop's release
+// build, so the teammate never trusts a checksum from the same channel as
+// the binary. An empty arm64 digest (none embedded) is left out, and the
+// installer then refuses an arm64 host.
 func teammateInstallLine(tag, amd64SHA, arm64SHA string) string {
 	pins := "amd64=" + amd64SHA
 	if arm64SHA != "" {
@@ -91,47 +87,71 @@ func defaultCadence(kind string) config.Cadence {
 	return config.CadenceTurnTimer
 }
 
+// The SHA256 digests of this release's published Linux tarballs
+// (agentcookie_<version>_linux_<arch>.tar.gz). They are embedded at release
+// build time, after the Linux tarballs are built and before the darwin
+// binary is, via
+//
+//	-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxAMD64SHA256=<sha>
+//	-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxARM64SHA256=<sha>
+//
+// (Makefile LINUX_SHA256_AMD64 / LINUX_SHA256_ARM64, filled by
+// scripts/linux-release-pins.sh; see docs/releasing.md). A dev build has
+// none and sends no pairing notice. The laptop never downloads a release to
+// compute them.
+var (
+	releaseLinuxAMD64SHA256 string
+	releaseLinuxARM64SHA256 string
+)
+
+// releasePin is the agentcookie release a pairing notice installs.
+type releasePin struct {
+	Tag string
+	// SHA256 is the linux_amd64 tarball's digest.
+	SHA256 string
+	// SHA256ARM64 is the linux_arm64 tarball's digest; empty when this
+	// build embeds none.
+	SHA256ARM64 string
+}
+
+// errNoReleasePin: this binary cannot pin a release for the install line.
+var errNoReleasePin = errors.New("this agentcookie build has no release pin; install a release build")
+
+// releaseTagRE is a published release tag: vX.Y.Z with an optional
+// alpha, beta or rc suffix. It rejects `git describe` output between tags
+// (-N-g<hash>), -dirty, goreleaser snapshots and the in-source dev default.
+var releaseTagRE = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.?[0-9]+)?)?$`)
+
+var sha256HexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// embeddedReleasePin builds the pin from the binary's version and its
+// embedded Linux digests. A version that is not a release tag, or a build
+// with no linux_amd64 digest, is errNoReleasePin. A build with only the
+// amd64 digest pins amd64 only.
+func embeddedReleasePin(version, amd64, arm64 string) (releasePin, error) {
+	tag := releaseTag(version)
+	if !releaseTagRE.MatchString(tag) {
+		return releasePin{}, fmt.Errorf("%w (version %s is not a release tag)", errNoReleasePin, version)
+	}
+	amd64, arm64 = strings.ToLower(strings.TrimSpace(amd64)), strings.ToLower(strings.TrimSpace(arm64))
+	if amd64 == "" {
+		return releasePin{}, fmt.Errorf("%w (no linux_amd64 digest embedded in %s)", errNoReleasePin, tag)
+	}
+	if !sha256HexRE.MatchString(amd64) {
+		return releasePin{}, fmt.Errorf("embedded linux_amd64 digest for %s is not a SHA256: %q", tag, amd64)
+	}
+	if arm64 != "" && !sha256HexRE.MatchString(arm64) {
+		return releasePin{}, fmt.Errorf("embedded linux_arm64 digest for %s is not a SHA256: %q", tag, arm64)
+	}
+	return releasePin{Tag: tag, SHA256: amd64, SHA256ARM64: arm64}, nil
+}
+
+// buildReleasePin is the running binary's pin.
+func buildReleasePin() (releasePin, error) {
+	return embeddedReleasePin(Version, releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256)
+}
+
 // releaseTag is the tag of the running release.
 func releaseTag(version string) string {
 	return "v" + strings.TrimPrefix(version, "v")
-}
-
-// linuxAssetURL is the Linux release archive for tag and arch (amd64 or
-// arm64).
-func linuxAssetURL(tag, arch string) string {
-	ver := strings.TrimPrefix(tag, "v")
-	return fmt.Sprintf("https://github.com/%s/releases/download/%s/agentcookie_%s_linux_%s.tar.gz", teammateRepo, tag, ver, arch)
-}
-
-// errReleaseAssetMissing: the release has no asset for that arch (404).
-var errReleaseAssetMissing = errors.New("release asset not published")
-
-// releaseSHA256Func computes the SHA256 of tag's Linux release asset for
-// arch. Production downloads it from GitHub; tests replace it.
-var releaseSHA256Func = downloadReleaseSHA256
-
-func downloadReleaseSHA256(ctx context.Context, tag, arch string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	url := linuxAssetURL(tag, arch)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("download %s: %w", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return "", fmt.Errorf("download %s: %w (is %s a published release?)", url, errReleaseAssetMissing, tag)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download %s: HTTP %d (is %s a published release?)", url, resp.StatusCode, tag)
-	}
-	h := sha256.New()
-	if _, err := io.Copy(h, io.LimitReader(resp.Body, 512<<20)); err != nil {
-		return "", fmt.Errorf("download %s: %w", url, err)
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }

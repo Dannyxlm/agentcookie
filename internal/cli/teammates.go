@@ -225,21 +225,16 @@ func (h *teammateHub) IsListed(name string) bool {
 	return h.loadErr == nil && h.present && h.cfg.Has(name)
 }
 
-// Unclassifiable reports whether teammate mode is present but a keystore
-// peer cannot be told apart from a teammate: the state store (which
-// remembers removed teammates and migrated peers) is unavailable, or no
-// teammates.yaml has loaded since the daemon started. Every keystore peer
-// is refused then (fail closed).
+// Unclassifiable reports whether a keystore peer cannot be told apart
+// from a teammate: the state store (which remembers removed teammates and
+// migrated peers) is unavailable, or teammates.yaml exists but no good copy
+// has loaded since the daemon started. Every keyed /pull is refused then
+// (fail closed). The store check holds whether or not teammates.yaml
+// exists: a leftover teammate key outlives a deleted list. A missing state
+// file opens as an empty store, so configs that never used teammates are
+// unaffected. PushHeld applies the same rule to legacy pushes.
 func (h *teammateHub) Unclassifiable() bool {
-	if h == nil {
-		return false
-	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	if !h.present {
-		return false
-	}
-	return h.store == nil || (h.loadErr != nil && h.cfg == nil)
+	return h.historyUnknown()
 }
 
 // IsTeammateName reports whether name belongs to teammate mode now or ever

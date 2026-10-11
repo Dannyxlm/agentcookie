@@ -77,9 +77,11 @@ type teammateLifecycle struct {
 	inputs  chan tmInput
 	reload  chan struct{}
 
-	lastRosterErr string
-	lastInboxErr  string
-	warnedNoNodes bool
+	lastRosterErr   string
+	lastInboxErr    string
+	warnedNoNodes   bool
+	warnedNoPin     bool
+	warnedAMD64Only bool
 }
 
 func newTeammateLifecycle(hub *teammateHub, home string) *teammateLifecycle {
@@ -472,7 +474,11 @@ func (l *teammateLifecycle) sendPairing(ctx context.Context, name, nodeID string
 	res, expires := l.pairingSend(ctx, name, nodeID)
 	if res.Outcome != tincan.OutcomeSent && res.Outcome != tincan.OutcomeHeld {
 		l.hub.CancelPairing(name)
-		l.logf("teammate %s: pairing notice not sent (%s): %v; retrying later", name, res.Outcome, res.Err)
+		// A missing release pin was logged once by releasePin; the
+		// reason is on the record either way.
+		if !errors.Is(res.Err, errNoReleasePin) {
+			l.logf("teammate %s: pairing notice not sent (%s): %v; retrying later", name, res.Outcome, res.Err)
+		}
 	} else if res.Outcome == tincan.OutcomeHeld {
 		l.logf("teammate %s: pairing notice %s is held by the Tincan approval gate; add agentcookie to that teammate's unless list in approval.json", name, res.RequestID)
 	} else {
@@ -485,11 +491,11 @@ func (l *teammateLifecycle) pairingSend(ctx context.Context, name, nodeID string
 	fail := func(err error) (tincan.SendResult, time.Time) {
 		return tincan.SendResult{Outcome: tincan.OutcomeError, Err: err}, time.Time{}
 	}
-	laptop, err := l.laptopName(ctx)
+	pin, err := l.releasePin()
 	if err != nil {
 		return fail(err)
 	}
-	pin, err := l.releasePin(ctx)
+	laptop, err := l.laptopName(ctx)
 	if err != nil {
 		return fail(err)
 	}
@@ -536,33 +542,22 @@ func (l *teammateLifecycle) cadenceFor(name string) config.Cadence {
 	return defaultCadence(rec.Kind)
 }
 
-// releasePin returns the running release's tag and the SHA256 of its
-// linux_amd64 and linux_arm64 assets, computed once per release and kept
-// in the state file. A release with no arm64 asset is pinned for amd64
-// only; any other failure leaves the release unpinned so it is retried.
-func (l *teammateLifecycle) releasePin(ctx context.Context) (state.ReleasePin, error) {
-	tag := releaseTag(Version)
-	if snap := l.hub.store.Snapshot(); snap.ReleasePin != nil && snap.ReleasePin.Tag == tag && snap.ReleasePin.SHA256 != "" {
-		return *snap.ReleasePin, nil
-	}
-	sha, err := releaseSHA256Func(ctx, tag, "amd64")
+// releasePin returns the release this build pins in the install line:
+// its own tag and the Linux digests embedded at release build time. A
+// build without them sends no pairing notice; the reason is logged once
+// and recorded on the teammate for status, doctor and teammates list.
+func (l *teammateLifecycle) releasePin() (releasePin, error) {
+	pin, err := buildReleasePin()
 	if err != nil {
-		return state.ReleasePin{}, fmt.Errorf("pin release %s for the install line: %w", tag, err)
+		if !l.warnedNoPin {
+			l.warnedNoPin = true
+			l.logf("teammates: %v; pairing notices are not sent until this laptop runs an agentcookie release build", err)
+		}
+		return releasePin{}, err
 	}
-	arm, err := releaseSHA256Func(ctx, tag, "arm64")
-	if errors.Is(err, errReleaseAssetMissing) {
-		l.logf("teammates: release %s has no linux_arm64 asset; the install line pins amd64 only and an arm64 teammate cannot install it", tag)
-		arm, err = "", nil
-	}
-	if err != nil {
-		return state.ReleasePin{}, fmt.Errorf("pin release %s (arm64) for the install line: %w", tag, err)
-	}
-	pin := state.ReleasePin{Tag: tag, SHA256: sha, SHA256ARM64: arm}
-	if err := l.hub.store.Update(func(st *state.TeammatesState) error {
-		st.ReleasePin = &pin
-		return nil
-	}); err != nil {
-		l.logf("teammates: %v", err)
+	if pin.SHA256ARM64 == "" && !l.warnedAMD64Only {
+		l.warnedAMD64Only = true
+		l.logf("teammates: release %s embeds no linux_arm64 digest; the install line pins amd64 only and an arm64 teammate cannot install it", pin.Tag)
 	}
 	return pin, nil
 }

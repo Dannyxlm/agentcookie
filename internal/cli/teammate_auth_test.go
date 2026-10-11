@@ -421,13 +421,15 @@ func TestWhoisCacheDoesNotRememberCanceledLookup(t *testing.T) {
 }
 
 // newNilStoreAuthFixture is a daemon whose teammates-state.json could not
-// be opened (nil store) with teammates.yaml set to body and keys for
-// grokbot and muse-box.
+// be opened (nil store) with teammates.yaml set to body (empty body = no
+// teammates.yaml) and keys for grokbot and muse-box.
 func newNilStoreAuthFixture(t *testing.T, body string) *authFixture {
 	t.Helper()
 	dir := t.TempDir()
 	withConfigDir(t, dir)
-	writeTeammatesFile(t, dir, body)
+	if body != "" {
+		writeTeammatesFile(t, dir, body)
+	}
 	for peer, key := range map[string]string{"grokbot": grokKey, musePeer: museKey} {
 		if err := keystore.Save(dir, &keystore.PeerKey{Peer: peer, Key: []byte(key)}); err != nil {
 			t.Fatal(err)
@@ -464,6 +466,43 @@ func TestTeammatePullRefusedWhenStateStoreUnavailable(t *testing.T) {
 	}
 	if rec := f.pull(t, museKey, strangerIP); rec.Code != http.StatusForbidden {
 		t.Fatalf("keystore peer while classification is impossible: status = %d, want 403", rec.Code)
+	}
+}
+
+// Fail closed: with no teammates.yaml but an unopenable state store, a
+// leftover teammate key (the owner deleted the list and restarted before
+// key cleanup ran) cannot be told apart from an ordinary peer key, so every
+// keyed /pull is refused from any node. The push side is held to match.
+func TestPullRefusedWithoutTeammatesFileWhenStateStoreUnavailable(t *testing.T) {
+	f := newNilStoreAuthFixture(t, "")
+	if f.hub.Active() {
+		t.Fatal("hub should be inactive without teammates.yaml")
+	}
+	for _, ip := range []string{grokIP, strangerIP} {
+		if rec := f.pull(t, grokKey, ip); rec.Code != http.StatusForbidden {
+			t.Fatalf("leftover teammate key from %s with no state store: status = %d, want 403", ip, rec.Code)
+		}
+		if rec := f.pull(t, museKey, ip); rec.Code != http.StatusForbidden {
+			t.Fatalf("keystore peer from %s with no state store: status = %d, want 403", ip, rec.Code)
+		}
+	}
+	if err := f.hub.PushHeld(musePeer); !errors.Is(err, errTeammateHistoryUnknown) {
+		t.Fatalf("PushHeld with no state store = %v, want errTeammateHistoryUnknown", err)
+	}
+}
+
+// A missing state file opens as an empty store, so a config that never
+// used teammates keeps serving its legacy peer keys.
+func TestLegacyPeerKeyServedWithFreshStateStore(t *testing.T) {
+	f := newAuthFixture(t, "")
+	if f.hub.Unclassifiable() {
+		t.Fatal("a fresh state store must not make peers unclassifiable")
+	}
+	if rec := f.pull(t, museKey, strangerIP); rec.Code != http.StatusOK {
+		t.Fatalf("legacy peer key with a fresh state store: status = %d, want 200", rec.Code)
+	}
+	if err := f.hub.PushHeld(musePeer); err != nil {
+		t.Fatalf("PushHeld with a fresh state store = %v, want nil", err)
 	}
 }
 

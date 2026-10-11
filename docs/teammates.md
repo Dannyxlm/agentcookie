@@ -62,7 +62,9 @@ The first time a listed agent appears on a machine, the laptop shows one dialog 
 - Not now leaves the teammate waiting. The dialog does not come back until the daemon restarts or the agent shows up on another machine. An unanswered dialog closes itself after 12 hours, which counts as Not now.
 - With no GUI session (for example over SSH), a plain notification names the terminal equivalent: `agentcookie teammates approve <name> --node <stableid>`. `agentcookie teammates list` shows the same command.
 
-After approval the laptop sends the agent one Tincan notice with an install line (pinned to a release tag and the SHA256 of each Linux asset, amd64 and arm64, which the laptop computed itself), a `join` command with a single-use code valid for 30 minutes, and the standing line. If the code expires before the agent uses it, a fresh one is sent the next time the agent checks Tincan, with no second approval.
+After approval the laptop sends the agent one Tincan notice with an install line (pinned to the laptop's own release tag and the SHA256 of each Linux asset, amd64 and arm64, which are embedded in the laptop's release build; the laptop downloads nothing to compute them), a `join` command with a single-use code valid for 30 minutes, and the standing line. If the code expires before the agent uses it, a fresh one is sent the next time the agent checks Tincan, with no second approval.
+
+A laptop running a build with no embedded pin (a dev build, or a version that is not a release tag) sends no pairing notice. The teammate stays approved and waiting, and `agentcookie teammates list`, `status`, and `doctor` show why: "this agentcookie build has no release pin; install a release build". Doctor's "Teammate release pin" line names the tag and arches the running binary pins. A release build that embeds only the amd64 digest pins amd64 only.
 
 ## The one standing line per agent
 
@@ -127,6 +129,6 @@ Or delete the name from `teammates.yaml`. Its key is deleted, its next pull is r
 - Cookies never travel through the Tincan relay. They go only over agentcookie's own sealed channel, keyed per teammate, from the laptop's port 9998 over Tailscale.
 - Every `/pair` and `/pull` is checked against the Tailscale node you approved (`tailscale whois` on the caller). A valid code or key from any other machine is refused and logged. A name on the roster grants nothing until you approve its machine.
 - The relay sees the pairing notice, which contains a single-use code and the laptop's name. The code expires in 30 minutes and only works from the approved machine.
-- The first join notice arrives before the agent has anything pinned. The standing line limits it to notices whose relay-authenticated sender is `agentcookie`, but under Tincan's full-trust model a compromised relay or teammate could still forge one. The install line verifies the binary against the SHA256 the laptop pinned, not a checksum from the same download.
+- The first join notice arrives before the agent has anything pinned. The standing line limits it to notices whose relay-authenticated sender is `agentcookie`, but under Tincan's full-trust model a compromised relay or teammate could still forge one. The install line verifies the binary against the SHA256 embedded in the laptop's release build, not a checksum from the same download.
 - A teammate's cookies are only as safe as that agent. Instinct reads outside content such as email, so a prompt-injected instinct could misuse cookies it legitimately holds. Listing it is your informed choice.
 - The laptop's `blocklist.yaml` (and its DBSC filtering) applies to every teammate exactly as it does to other sinks. It is the control over which sites a teammate can act on; there are no per-teammate blocklists.

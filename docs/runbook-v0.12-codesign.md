@@ -45,10 +45,12 @@ Every subsequent rebuild matches the same ACL entry without a prompt.
   flow.
 - `make release` builds a Universal 2 `bin/agentcookie`, signs it via
   `scripts/sign.sh`, and notarizes it. The release workflow
-  (`.github/workflows/release.yml`) runs `make release` on a macOS
-  runner after importing the cert from the `CERTIFICATE_OSX_APPLICATION`
-  secret on every tagged release. GoReleaser builds only the Linux
-  binaries, which are not signed.
+  (`.github/workflows/release.yml`) runs it through `make release-pinned`
+  on a macOS runner after importing the cert from the
+  `CERTIFICATE_OSX_APPLICATION` secret on every tagged release.
+  GoReleaser builds only the Linux binaries, which are not signed; they
+  are built first so their SHA256s can be embedded in the darwin build
+  (see docs/releasing.md).
 
 Every path goes through `scripts/sign.sh`, which signs with Hardened
 Runtime, a secure timestamp, and `scripts/agentcookie.entitlements`.
@@ -245,7 +247,8 @@ CI release flow:
 The release workflow has to do the same store-credentials dance on
 GitHub Actions. Add the app-specific password as the
 `AC_NOTARY_PASSWORD` GitHub secret. The workflow runs
-`xcrun notarytool store-credentials` before invoking `make release`.
+`xcrun notarytool store-credentials` before invoking `make release`
+(via `make release-pinned`; see docs/releasing.md for the release order).
 
 ## Troubleshooting
 

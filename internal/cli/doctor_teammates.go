@@ -102,7 +102,7 @@ func checkTeammates(d doctorDeps) []Check {
 	if d.LoadSourceState != nil {
 		src, srcErr = d.LoadSourceState()
 	}
-	checks := []Check{checkTeammateListener(src, srcErr)}
+	checks := []Check{checkTeammateListener(src, srcErr), checkTeammateReleasePin()}
 
 	if v.cfgErr != nil {
 		checks = append(checks, Check{
@@ -142,6 +142,27 @@ func checkTeammateListener(src *state.SourceState, err error) Check {
 	default:
 		c.Severity, c.Detail = SeverityFail, src.PullListener+": waiting for a tailnet address, so no teammate can pull or pair"
 		c.Remediation = "bring Tailscale up on this laptop; the listener binds as soon as it has a 100.x address"
+	}
+	return c
+}
+
+// checkTeammateReleasePin reports the release this binary pins in pairing
+// notices: its own tag and the Linux digests embedded at release build
+// time. Without them the daemon sends no pairing notice.
+func checkTeammateReleasePin() Check {
+	c := Check{Name: "Teammate release pin"}
+	pin, err := buildReleasePin()
+	switch {
+	case err != nil:
+		c.Severity = SeverityFail
+		c.Detail = err.Error() + "; the daemon sends no pairing notice, so every approved teammate keeps waiting"
+		c.Remediation = "run an agentcookie release build on this laptop (its Linux tarball digests are embedded at build time)"
+	case pin.SHA256ARM64 == "":
+		c.Severity = SeverityWarn
+		c.Detail = pin.Tag + " pins linux amd64 only; an arm64 teammate cannot install it"
+	default:
+		c.Severity = SeverityOK
+		c.Detail = pin.Tag + " pins linux amd64 and arm64"
 	}
 	return c
 }

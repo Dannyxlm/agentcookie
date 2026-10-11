@@ -9,7 +9,8 @@
 #   e.g. teammate-install.sh v1.4.0 amd64=<sha256> arm64=<sha256>
 #
 # The laptop pins the tag and each digest into the pairing notice. Each
-# SHA256 is the one the laptop computed from that release asset, so this
+# SHA256 is embedded in the laptop's release build (computed from the
+# published Linux tarball before the darwin binary was built), so this
 # script never trusts a checksum fetched from the same place as the binary
 # (no checksums.txt). The digest for this host's arch is used; a host arch
 # with no pin is refused, as are unpinned refs such as latest or main.

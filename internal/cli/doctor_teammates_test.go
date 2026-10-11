@@ -105,6 +105,24 @@ func TestDoctorTeammatesConfigParseError(t *testing.T) {
 	wantCheck(t, findCheck(t, checkTeammates(ok), "Teammates config"), SeverityOK, "2 listed")
 }
 
+// Doctor names a build that cannot pin a release for the pairing notice,
+// since the daemon then sends no notice at all.
+func TestDoctorTeammatesReleasePin(t *testing.T) {
+	prevVersion, prevAMD64, prevARM64 := Version, releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256
+	t.Cleanup(func() { Version, releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = prevVersion, prevAMD64, prevARM64 })
+	d := newTeammateDoctorDeps(t, twoTeammates, nil)
+
+	Version, releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = "1.3.0-rc.1", strings.Repeat("a", 64), strings.Repeat("b", 64)
+	wantCheck(t, findCheck(t, checkTeammates(d), "Teammate release pin"), SeverityOK, "v1.3.0-rc.1", "amd64", "arm64")
+
+	releaseLinuxARM64SHA256 = ""
+	wantCheck(t, findCheck(t, checkTeammates(d), "Teammate release pin"), SeverityWarn, "v1.3.0-rc.1", "amd64 only")
+
+	Version, releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = "0.0.1-dev", "", ""
+	wantCheck(t, findCheck(t, checkTeammates(d), "Teammate release pin"), SeverityFail,
+		"this agentcookie build has no release pin; install a release build", "no pairing notice")
+}
+
 func TestDoctorTeammatesTincan(t *testing.T) {
 	ok := newTeammateDoctorDeps(t, twoTeammates, nil)
 	wantCheck(t, findCheck(t, checkTeammates(ok), "Tincan"), SeverityOK)

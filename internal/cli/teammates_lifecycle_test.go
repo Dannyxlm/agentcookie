@@ -34,8 +34,14 @@ type lcHarness struct {
 	mu      sync.Mutex
 	dialogs []notify.ApprovalRequest
 	answer  bool
-	noARM64 bool // the release has no linux_arm64 asset
 }
+
+// lcAMD64SHA and lcARM64SHA are the Linux digests the harness embeds as
+// if this were a release build.
+var (
+	lcAMD64SHA = "ab12" + strings.Repeat("0", 60)
+	lcARM64SHA = "cd34" + strings.Repeat("0", 60)
+)
 
 const lcTincanConfig = "/cfg/tincan/agentcookie.json"
 
@@ -52,7 +58,8 @@ func newLCHarness(t *testing.T, names ...string) *lcHarness {
 	h.lc = newTeammateLifecycle(hub, h.home)
 	h.lc.cookiesChangedAt = func() time.Time { return time.Time{} }
 
-	prevDialog, prevNotice, prevDNS, prevSHA, prevVersion := approvalDialogFunc, ownerNoticeFunc, laptopDNSNameFunc, releaseSHA256Func, Version
+	prevDialog, prevNotice, prevDNS, prevVersion := approvalDialogFunc, ownerNoticeFunc, laptopDNSNameFunc, Version
+	prevAMD64, prevARM64 := releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256
 	approvalDialogFunc = func(_ context.Context, req notify.ApprovalRequest) (bool, error) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -61,20 +68,11 @@ func newLCHarness(t *testing.T, names ...string) *lcHarness {
 	}
 	ownerNoticeFunc = func(context.Context, string, string) error { return nil }
 	laptopDNSNameFunc = func(context.Context) (string, error) { return "mac-laptop.tail2b6977.ts.net", nil }
-	releaseSHA256Func = func(_ context.Context, tag, arch string) (string, error) {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if h.noARM64 && arch == "arm64" {
-			return "", errReleaseAssetMissing
-		}
-		if arch == "arm64" {
-			return "cd34" + strings.Repeat("0", 60), nil
-		}
-		return "ab12" + strings.Repeat("0", 60), nil
-	}
+	releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = lcAMD64SHA, lcARM64SHA
 	Version = "1.4.0"
 	t.Cleanup(func() {
-		approvalDialogFunc, ownerNoticeFunc, laptopDNSNameFunc, releaseSHA256Func, Version = prevDialog, prevNotice, prevDNS, prevSHA, prevVersion
+		approvalDialogFunc, ownerNoticeFunc, laptopDNSNameFunc, Version = prevDialog, prevNotice, prevDNS, prevVersion
+		releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = prevAMD64, prevARM64
 	})
 	h.setRoster()
 	h.fake.Set("inbox", `{"requests":[],"replies":[]}`, "", 0)
@@ -192,9 +190,8 @@ func TestLifecycleFirstSightingApprovalAndPairingNotice(t *testing.T) {
 		t.Fatalf("standing line = %q", teammateStandingLine())
 	}
 	snap := h.hub.store.Snapshot()
-	if snap.LaptopDNSName != "mac-laptop.tail2b6977.ts.net" || snap.ReleasePin == nil || snap.ReleasePin.Tag != "v1.4.0" ||
-		snap.ReleasePin.SHA256 != "ab12"+strings.Repeat("0", 60) || snap.ReleasePin.SHA256ARM64 != "cd34"+strings.Repeat("0", 60) {
-		t.Fatalf("laptop name and release pin not kept: %+v", snap)
+	if snap.LaptopDNSName != "mac-laptop.tail2b6977.ts.net" {
+		t.Fatalf("laptop name not kept: %+v", snap)
 	}
 	if !snap.Tincan.NodeFieldsVisible || snap.Tincan.Path != h.fake.Path {
 		t.Fatalf("tincan status = %+v", snap.Tincan)
@@ -546,22 +543,56 @@ func TestLifecycleLaptopNameUsesStoredName(t *testing.T) {
 	}
 }
 
-// A release with no linux_arm64 asset pins amd64 only; the install line
-// then carries no arm64 digest, so the installer refuses an arm64 host.
-func TestLifecyclePinsAMD64OnlyWhenARM64AssetMissing(t *testing.T) {
+// A release build with only the linux_amd64 digest embedded pins amd64
+// only; the install line then carries no arm64 digest, so the installer
+// refuses an arm64 host.
+func TestLifecyclePinsAMD64OnlyWhenOnlyAMD64Embedded(t *testing.T) {
 	h := newLCHarness(t, "grokbot")
-	h.noARM64 = true
+	releaseLinuxARM64SHA256 = ""
 	h.approved()
 	asks := h.asks()
 	if len(asks) != 1 {
 		t.Fatalf("asks = %d", len(asks))
 	}
 	text := asks[0].Args[len(asks[0].Args)-1]
-	if !strings.Contains(text, "| bash -s -- v1.4.0 amd64=ab12"+strings.Repeat("0", 60)+"\n") || strings.Contains(text, "arm64=") {
+	if !strings.Contains(text, "| bash -s -- v1.4.0 amd64="+lcAMD64SHA+"\n") || strings.Contains(text, "arm64=") {
 		t.Fatalf("install line should pin amd64 only:\n%s", text)
 	}
-	if pin := h.hub.store.Snapshot().ReleasePin; pin == nil || pin.SHA256ARM64 != "" || pin.SHA256 == "" {
-		t.Fatalf("pin = %+v", pin)
+}
+
+// A build with no embedded release pin (a dev build, or a version that is
+// not a release tag) sends no pairing notice: the teammate stays in
+// pairing with the reason recorded for status, doctor and teammates list,
+// and the reason is logged once however often the send is retried.
+func TestLifecycleNoReleasePinSendsNoNotice(t *testing.T) {
+	for name, setup := range map[string]func(){
+		"no digests":     func() { releaseLinuxAMD64SHA256, releaseLinuxARM64SHA256 = "", "" },
+		"not a release":  func() { Version = "1.4.0-3-gabc1234" },
+		"dev default":    func() { Version = "0.0.1-dev" },
+		"dirty describe": func() { Version = "1.4.0-dirty" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newLCHarness(t, "grokbot")
+			setup()
+			h.approved()
+			for range 3 {
+				h.now = h.now.Add(notifyBackoffMax + time.Minute)
+				h.lc.syncAll(context.Background())
+			}
+			if n := len(h.asks()); n != 0 {
+				t.Fatalf("asks = %d, want no pairing notice without a release pin", n)
+			}
+			rec := h.rec("grokbot")
+			if rec.Phase != state.PhasePairing || !strings.Contains(rec.NotifyError, "this agentcookie build has no release pin; install a release build") {
+				t.Fatalf("rec = %+v, want pairing with the no-pin reason", rec)
+			}
+			if len(h.hub.PendingPairings()) != 0 {
+				t.Fatal("no pairing code may be live without a notice")
+			}
+			if got := strings.Count(h.log.String(), "no release pin"); got != 1 {
+				t.Fatalf("no-pin reason logged %d times, want once:\n%s", got, h.log.String())
+			}
+		})
 	}
 }
 

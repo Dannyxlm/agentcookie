@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# release_asset_test.sh - Selection tests for the macOS installer and the
-# release-tarball archive name. No extra test framework; run:
+# release_asset_test.sh - Selection tests for the macOS installer, the
+# release-tarball archive name, the teammate installer, and the Linux
+# release pins embedded in the darwin build. No extra test framework; run:
 #
 #   bash scripts/release_asset_test.sh
 
@@ -774,6 +775,71 @@ assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_arch=$tm_sha")" "0" "
 if compgen -G "$tm/bin/.agentcookie.new.*" >/dev/null; then
   fail "teammate-install left a temporary file behind"
 fi
+
+# --- Linux release pins (scripts/linux-release-pins.sh) ----------------
+# The darwin release build embeds the SHA256 of each published Linux
+# tarball. The script hashes dist/ after the Linux build and prints the
+# make arguments; it must refuse anything it cannot pin exactly.
+
+lp="$(mktemp -d -t agentcookie-pins.XXXXXX)"
+lp_tag="v9.9.9-rc.1"
+mkdir -p "$lp/dist" "$lp/amd-only"
+printf 'linux amd64 tarball\n' >"$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz"
+printf 'linux arm64 tarball\n' >"$lp/dist/agentcookie_9.9.9-rc.1_linux_arm64.tar.gz"
+cp "$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz" "$lp/amd-only/"
+lp_amd="$(shasum -a 256 "$lp/dist/agentcookie_9.9.9-rc.1_linux_amd64.tar.gz" | awk '{print $1}')"
+lp_arm="$(shasum -a 256 "$lp/dist/agentcookie_9.9.9-rc.1_linux_arm64.tar.gz" | awk '{print $1}')"
+
+# run_pins ARGS...: prints "<exit>|<stdout>"; stderr to $lp/err.
+run_pins() {
+  local out rc=0
+  out="$(bash "$ROOT/scripts/linux-release-pins.sh" "$@" 2>"$lp/err")" || rc=$?
+  printf '%s|%s\n' "$rc" "$out"
+}
+
+assert_eq "$(run_pins "$lp_tag" "$lp/dist")" "0|LINUX_SHA256_AMD64=$lp_amd LINUX_SHA256_ARM64=$lp_arm" "linux-release-pins prints both digests as make arguments"
+assert_eq "$(run_pins "$lp_tag" "$lp/amd-only")" "0|LINUX_SHA256_AMD64=$lp_amd" "linux-release-pins pins amd64 only when there is no arm64 tarball"
+if ! grep -qF "linux_arm64" "$lp/err"; then
+  fail "linux-release-pins did not warn about the missing arm64 tarball: $(cat "$lp/err")"
+fi
+assert_eq "$(run_pins "v9.9.8" "$lp/dist")" "2|" "linux-release-pins refuses a tag with no linux_amd64 tarball"
+for ref in latest main 9.9.9 v9.9 v9.9.9-2-gabc1234 v9.9.9-dirty; do
+  assert_eq "$(run_pins "$ref" "$lp/dist")" "2|" "linux-release-pins refuses non-release ref $ref"
+done
+
+# A goreleaser checksums.txt that disagrees with the tarball on disk means
+# dist/ was rebuilt or tampered with; refuse to pin.
+mkdir -p "$lp/mismatch"
+cp "$lp/dist/"*.tar.gz "$lp/mismatch/"
+printf '%s  agentcookie_9.9.9-rc.1_linux_amd64.tar.gz\n%s  agentcookie_9.9.9-rc.1_linux_arm64.tar.gz\n' "$lp_amd" "$lp_amd" >"$lp/mismatch/checksums.txt"
+assert_eq "$(run_pins "$lp_tag" "$lp/mismatch")" "3|" "linux-release-pins refuses digests that disagree with checksums.txt"
+printf '%s  agentcookie_9.9.9-rc.1_linux_amd64.tar.gz\n%s  agentcookie_9.9.9-rc.1_linux_arm64.tar.gz\n' "$lp_amd" "$lp_arm" >"$lp/dist/checksums.txt"
+assert_eq "$(run_pins "$lp_tag" "$lp/dist")" "0|LINUX_SHA256_AMD64=$lp_amd LINUX_SHA256_ARM64=$lp_arm" "linux-release-pins accepts a matching checksums.txt"
+
+# --check-binary: the built darwin binary must carry every digest dist/
+# would pin, so a rebuilt Linux tarball after the darwin build is caught.
+printf 'binary %s and %s\n' "$lp_amd" "$lp_arm" >"$lp/bin-good"
+printf 'binary %s only\n' "$lp_amd" >"$lp/bin-amd"
+assert_eq "$(run_pins --check-binary "$lp/bin-good" "$lp_tag" "$lp/dist")" "0|" "linux-release-pins --check-binary accepts a binary with both digests"
+assert_eq "$(run_pins --check-binary "$lp/bin-amd" "$lp_tag" "$lp/dist")" "3|" "linux-release-pins --check-binary refuses a binary missing the arm64 digest"
+assert_eq "$(run_pins --check-binary "$lp/bin-amd" "$lp_tag" "$lp/amd-only")" "0|" "linux-release-pins --check-binary accepts an amd64-only pin"
+
+# The Makefile injects the digests into the darwin build's ldflags.
+lp_make="$(make -s -n -C "$ROOT" build LINUX_SHA256_AMD64="$lp_amd" LINUX_SHA256_ARM64="$lp_arm" 2>/dev/null || true)"
+for want in "-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxAMD64SHA256=$lp_amd" "-X github.com/mvanhorn/agentcookie/internal/cli.releaseLinuxARM64SHA256=$lp_arm"; do
+  if [[ "$lp_make" != *"$want"* ]]; then
+    fail "make build does not pass '$want' (got: $lp_make)"
+  fi
+done
+lp_make="$(make -s -n -C "$ROOT" build 2>/dev/null || true)"
+if [[ "$lp_make" == *releaseLinux* ]]; then
+  fail "make build without LINUX_SHA256_* must embed no release pin (got: $lp_make)"
+fi
+# release-pinned needs TAG and refuses to run before any build when it is missing.
+if make -s -C "$ROOT" release-pinned >/dev/null 2>"$lp/err"; then
+  fail "make release-pinned without TAG succeeded"
+fi
+rm -rf "$lp"
 
 if [[ $failures -ne 0 ]]; then
   echo "$failures test(s) failed" >&2
