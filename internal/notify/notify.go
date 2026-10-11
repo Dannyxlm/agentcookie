@@ -74,11 +74,6 @@ func dialogScript(req ApprovalRequest, giveUpSeconds int) string {
 		appleString(ButtonNotNow), appleString(ButtonApprove), appleString(ButtonNotNow), appleString(ButtonNotNow), giveUpSeconds)
 }
 
-// notificationScript posts a plain notification.
-func notificationScript(title, body string) string {
-	return fmt.Sprintf("display notification %s with title %s", appleString(body), appleString(title))
-}
-
 // parseDialogResult reads osascript's dialog output: Approve only when
 // the Approve button was pressed and the dialog did not give up.
 func parseDialogResult(out string) bool {

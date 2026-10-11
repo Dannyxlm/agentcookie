@@ -47,3 +47,8 @@ func show(ctx context.Context, title, body string) error {
 	}
 	return nil
 }
+
+// notificationScript posts a plain notification.
+func notificationScript(title, body string) string {
+	return fmt.Sprintf("display notification %s with title %s", appleString(body), appleString(title))
+}
