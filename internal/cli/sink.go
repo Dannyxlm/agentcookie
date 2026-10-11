@@ -271,8 +271,13 @@ func (c *cmuxSurfaceCache) adapters(cfg *config.SinkConfig) []sinkpush.Adapter {
 	if c.adapter == nil || c.binary != binary || !slices.Equal(c.filter, cfg.Cmux.DomainFilter) {
 		c.binary = binary
 		c.filter = slices.Clone(cfg.Cmux.DomainFilter)
-		c.adapter = sinkpush.NewCmux(cfg.Cmux.CmuxPath, c.filter)
-		fmt.Fprintln(os.Stderr, "agentcookie sink: cmux delivery surface enabled")
+		if c.adapter == nil {
+			c.adapter = sinkpush.NewCmux(cfg.Cmux.CmuxPath, c.filter)
+			fmt.Fprintln(os.Stderr, "agentcookie sink: cmux delivery surface enabled")
+		} else {
+			c.adapter = c.adapter.Reconfigured(cfg.Cmux.CmuxPath, c.filter)
+			fmt.Fprintln(os.Stderr, "agentcookie sink: cmux settings changed; keeping its background tab")
+		}
 	}
 	return []sinkpush.Adapter{c.adapter}
 }

@@ -101,6 +101,18 @@ func NewCmux(cmuxPath string, domainFilter []string) *CmuxAdapter {
 	return a
 }
 
+// Reconfigured returns a cmux adapter with new settings that keeps a's
+// hidden background tab, so a settings change never leaves an unused tab
+// open in cmux. A tab that is gone is re-added once on the next push, as
+// with any stale surface.
+func (a *CmuxAdapter) Reconfigured(cmuxPath string, domainFilter []string) *CmuxAdapter {
+	n := NewCmux(cmuxPath, domainFilter)
+	a.mu.Lock()
+	n.surfaceID = a.surfaceID
+	a.mu.Unlock()
+	return n
+}
+
 // ResolveCmuxBinary returns the cmux CLI path to use: the explicit
 // cmuxPath when set, otherwise a `cmux` on PATH, otherwise the canonical
 // app-bundle location. Shared by the adapter and the doctor check.
