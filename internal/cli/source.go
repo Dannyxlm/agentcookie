@@ -187,6 +187,9 @@ func runSource(cmd *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
+	// Teammate lifecycle: roster polling, approval, pairing notices and
+	// re-pairs. Idle until teammates.yaml lists someone.
+	startTeammateLifecycle(cmd.Context(), activeTeammates, home)
 
 	if cfg.CDPSource.Enabled {
 		return runCDPSourceWatch(cmd.Context(), push, cfg.CDPSource.Endpoint, sourceVerbose)

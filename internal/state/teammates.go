@@ -36,7 +36,57 @@ type TeammatesState struct {
 	// file loads. Teammate pulls and pairings are suspended while it is set.
 	ConfigError   string    `json:"config_error,omitempty"`
 	ConfigErrorAt time.Time `json:"config_error_at,omitempty"`
+
+	// Tincan is the teammate lifecycle's last view of the relay.
+	Tincan TincanStatus `json:"tincan,omitzero"`
+	// LaptopDNSName is this laptop's MagicDNS name, last discovered from
+	// Tailscale. Pairing notices pin it as the laptop teammates pull from.
+	LaptopDNSName string `json:"laptop_dns_name,omitempty"`
+	// ReleasePin is the release a pairing notice installs, with the SHA256
+	// of its Linux asset, computed once per release.
+	ReleasePin *ReleasePin `json:"release_pin,omitempty"`
 }
+
+// TincanStatus is what the lifecycle last saw of the Tincan relay.
+type TincanStatus struct {
+	// Path is the resolved absolute tincan binary.
+	Path string `json:"path,omitempty"`
+	// LastRosterAt is the last successful roster read.
+	LastRosterAt time.Time `json:"last_roster_at,omitzero"`
+	// NodeFieldsVisible: the last roster carried admin node fields. False
+	// means an older relay or a laptop missing from the relay's --admin
+	// list, and every teammate stays waiting for its machine.
+	NodeFieldsVisible bool      `json:"node_fields_visible,omitempty"`
+	LastError         string    `json:"last_error,omitempty"`
+	LastErrorAt       time.Time `json:"last_error_at,omitzero"`
+}
+
+// ReleasePin is the agentcookie release a teammate installs.
+type ReleasePin struct {
+	Tag    string `json:"tag"`
+	SHA256 string `json:"sha256"`
+}
+
+// Teammate lifecycle phases (TeammateRecord.Phase).
+const (
+	PhaseWaitingForNode   = "waiting_for_node"
+	PhaseAwaitingApproval = "awaiting_approval"
+	PhasePairing          = "pairing"
+	PhaseHeld             = "held"
+	PhasePaired           = "paired"
+	PhaseRemoved          = "removed"
+)
+
+// Notify purposes and statuses (TeammateRecord.NotifyPurpose, NotifyStatus).
+const (
+	NotifyPurposePairing = "pairing"
+	NotifyPurposeStale   = "stale"
+
+	NotifySent        = "sent"
+	NotifyHeld        = "held"
+	NotifyRateLimited = "rate-limited"
+	NotifyError       = "error"
+)
 
 // TeammateRecord is one teammate's binding and history.
 type TeammateRecord struct {
@@ -54,6 +104,34 @@ type TeammateRecord struct {
 	LastPulledAt     time.Time `json:"last_pulled_at,omitempty"`
 	LastPullError    string    `json:"last_pull_error,omitempty"`
 	LastPullErrorAt  time.Time `json:"last_pull_error_at,omitempty"`
+
+	// Lifecycle fields, written by the teammate lifecycle.
+
+	// Phase is one of the Phase* constants; empty before the first roster.
+	Phase string `json:"phase,omitempty"`
+	// Kind is the agent's Tincan kind from the roster.
+	Kind string `json:"kind,omitempty"`
+	// PendingNode* is the machine waiting for the owner's approval.
+	PendingNodeID   string `json:"pending_node_id,omitempty"`
+	PendingNodeName string `json:"pending_node_name,omitempty"`
+	PendingNodeUser string `json:"pending_node_user,omitempty"`
+	// ReplacesNode* is the previously bound machine a pending one replaces.
+	ReplacesNodeID   string `json:"replaces_node_id,omitempty"`
+	ReplacesNodeName string `json:"replaces_node_name,omitempty"`
+	// RelaySeenAt is the agent's latest relay call the roster showed.
+	RelaySeenAt time.Time `json:"relay_seen_at,omitzero"`
+	// The open (or last) notify to this teammate. At most one is open.
+	NotifyID      string    `json:"notify_id,omitempty"`
+	NotifyPurpose string    `json:"notify_purpose,omitempty"`
+	NotifyStatus  string    `json:"notify_status,omitempty"`
+	NotifySentAt  time.Time `json:"notify_sent_at,omitzero"`
+	NotifyError   string    `json:"notify_error,omitempty"`
+	// CodeExpiresAt is when the code in the last pairing notice expires.
+	CodeExpiresAt time.Time `json:"code_expires_at,omitzero"`
+	// LastRepairAt is the last automatic re-pair after a lost key.
+	LastRepairAt time.Time `json:"last_repair_at,omitzero"`
+	// StaleNotifiedAt is the last staleness notice.
+	StaleNotifiedAt time.Time `json:"stale_notified_at,omitzero"`
 }
 
 // MigratedLegacyPeer is a legacy push peer moved onto teammate mode.
@@ -107,6 +185,10 @@ func (s *TeammatesState) clone() TeammatesState {
 		}
 	}
 	out.MigratedLegacy = append([]MigratedLegacyPeer(nil), s.MigratedLegacy...)
+	if s.ReleasePin != nil {
+		pin := *s.ReleasePin
+		out.ReleasePin = &pin
+	}
 	return out
 }
 

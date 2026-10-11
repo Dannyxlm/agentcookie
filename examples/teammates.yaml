@@ -26,6 +26,8 @@ teammates:
 # Tailscale node and are rejected.
 
 # Optional: the tincan CLI and the TINCAN_CONFIG of the laptop's dedicated
-# `agentcookie` Tincan agent.
+# `agentcookie` Tincan agent. Without tincan_path, PATH, ~/bin and
+# ~/.local/bin are searched (`agentcookie teammates setup` records what it
+# finds here). tincan_config defaults to ~/.config/tincan/agentcookie.json.
 # tincan_path: ~/.local/bin/tincan
-# tincan_config: ~/.config/agentcookie/tincan/client.json
+# tincan_config: ~/.config/tincan/agentcookie.json

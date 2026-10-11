@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +32,28 @@ type pullCache struct {
 	mu      sync.RWMutex
 	payload []byte
 	gen     uint64
+	// changedAt is when a stored envelope last differed from the one
+	// before it; the teammate staleness notice compares pulls against it.
+	changedAt time.Time
+}
+
+// ChangedAt returns when the served envelope last changed (zero before
+// the first one).
+func (c *pullCache) ChangedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.changedAt
+}
+
+// setLocked stores payload and notes a change. c.mu must be held.
+func (c *pullCache) setLocked(payload []byte) {
+	if !bytes.Equal(c.payload, payload) {
+		c.changedAt = time.Now()
+	}
+	c.payload = append([]byte(nil), payload...)
 }
 
 func newPullCache() *pullCache { return &pullCache{} }
@@ -51,7 +74,7 @@ func (c *pullCache) Store(payload []byte) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.payload = append([]byte(nil), payload...)
+	c.setLocked(payload)
 }
 
 func (c *pullCache) StoreIfCurrent(gen uint64, payload []byte) {
@@ -63,7 +86,7 @@ func (c *pullCache) StoreIfCurrent(gen uint64, payload []byte) {
 	if gen != c.gen {
 		return
 	}
-	c.payload = append([]byte(nil), payload...)
+	c.setLocked(payload)
 }
 
 func (c *pullCache) Load() []byte {
