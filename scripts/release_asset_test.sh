@@ -702,6 +702,56 @@ if ! grep -qF "is missing the $APPLE_EVENTS_KEY entitlement" "$tmp/sign.err"; th
 fi
 assert_eq "$(run_sign_with_stub true)" "0" "sign.sh passes when the entitlement is true"
 
+# teammate-install.sh: pinned tag + pinned SHA256, from a local file://
+# release fixture (no network).
+AGENTCOOKIE_TEAMMATE_INSTALL_LIB_ONLY=1
+# shellcheck disable=SC1091
+source "$ROOT/scripts/teammate-install.sh"
+tm="$tmp/teammate"
+tm_tag="v9.8.7"
+tm_arch="$(teammate_linux_arch "$(uname -m)")"
+tm_asset="$(teammate_asset_name "$tm_tag" "$tm_arch")"
+assert_eq "$tm_asset" "agentcookie_9.8.7_linux_${tm_arch}.tar.gz" "teammate asset name"
+mkdir -p "$tm/release/$tm_tag" "$tm/stage"
+printf '#!/bin/sh\necho agentcookie-teammate-fixture\n' > "$tm/stage/agentcookie"
+chmod +x "$tm/stage/agentcookie"
+tar -czf "$tm/release/$tm_tag/$tm_asset" -C "$tm/stage" agentcookie
+tm_sha="$(teammate_sha256_of "$tm/release/$tm_tag/$tm_asset")"
+tm_bad_sha="$(printf '0%.0s' {1..64})"
+
+# run_teammate_install DEST ARGS...: prints the exit code; stderr to $tm/err.
+run_teammate_install() {
+  local dest="$1" rc=0
+  shift
+  AGENTCOOKIE_RELEASE_BASE_URL="file://$tm/release" AGENTCOOKIE_INSTALL_DIR="$dest" \
+    bash "$ROOT/scripts/teammate-install.sh" "$@" >/dev/null 2>"$tm/err" || rc=$?
+  echo "$rc"
+}
+
+for ref in latest main HEAD 1.2.3 v1.2; do
+  assert_eq "$(run_teammate_install "$tm/bin-ref" "$ref" "$tm_sha")" "2" "teammate-install refuses unpinned ref $ref"
+done
+if [[ -e "$tm/bin-ref/agentcookie" ]]; then
+  fail "teammate-install installed from an unpinned ref"
+fi
+
+assert_eq "$(run_teammate_install "$tm/bin-bad" "$tm_tag" "$tm_bad_sha")" "4" "teammate-install refuses a SHA256 mismatch"
+if [[ -e "$tm/bin-bad/agentcookie" ]]; then
+  fail "teammate-install installed a binary whose SHA256 differs from the pinned value"
+fi
+if ! grep -qF "SHA256 mismatch" "$tm/err"; then
+  fail "teammate-install did not name the SHA256 mismatch"
+fi
+
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_sha")" "0" "teammate-install installs a pinned, matching asset"
+if [[ ! -x "$tm/bin/agentcookie" ]] || [[ "$("$tm/bin/agentcookie")" != "agentcookie-teammate-fixture" ]]; then
+  fail "teammate-install did not install the release binary as an executable"
+fi
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_sha")" "0" "teammate-install rerun replaces in place"
+if compgen -G "$tm/bin/.agentcookie.new.*" >/dev/null; then
+  fail "teammate-install left a temporary file behind"
+fi
+
 if [[ $failures -ne 0 ]]; then
   echo "$failures test(s) failed" >&2
   exit 1

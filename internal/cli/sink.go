@@ -36,6 +36,8 @@ var (
 	sinkDryRun       bool
 	sinkPullFrom     string
 	sinkPullInterval time.Duration
+	sinkPullOnce     bool
+	sinkPullLoop     bool
 )
 
 var sinkCmd = &cobra.Command{
@@ -70,15 +72,32 @@ func init() {
 	sinkCmd.Flags().BoolVar(&sinkDryRun, "dry-run", false, "accept and decrypt sync payloads but do NOT touch Chrome Safe Storage or write any cookies; dump batches to stderr")
 	sinkCmd.Flags().StringVar(&sinkPullFrom, "pull-from", "", "poll this source (host, host:port, or URL) via GET /pull instead of binding /sync; for client-only/inbound-blocked tailnets")
 	sinkCmd.Flags().DurationVar(&sinkPullInterval, "pull-interval", 30*time.Second, "how often to poll --pull-from")
+	sinkCmd.Flags().BoolVar(&sinkPullOnce, "pull-once", false, "pull once from the laptop pinned in sink.yaml (set up by `agentcookie join`) and exit: 0 applied or nothing new, 3 laptop unreachable, 4 re-pair needed")
+	sinkCmd.Flags().BoolVar(&sinkPullLoop, "pull-loop", false, "internal: the background pull loop that --pull-once starts for cadence turn+timer")
+	_ = sinkCmd.Flags().MarkHidden("pull-loop")
 }
 
 func runSink(cmd *cobra.Command, args []string) error {
+	switch {
+	case sinkPullOnce && sinkPullLoop:
+		return fmt.Errorf("--pull-once and --pull-loop cannot be combined")
+	case sinkPullOnce:
+		return runSinkPullOnce(cmd.Context(), cmd.OutOrStdout())
+	case sinkPullLoop:
+		return runTeammatePullLoop(cmd.Context())
+	}
 	cfg, err := config.LoadSink(common.ConfigDir)
 	if err != nil {
 		return err
 	}
 
-	if sinkPullFrom != "" && sinkPullInterval <= 0 {
+	// --pull-from wins; otherwise a pull-mode sink.yaml (written by
+	// `agentcookie join`) polls its pinned laptop.
+	pullFrom := sinkPullFrom
+	if pullFrom == "" && cfg.PullMode() {
+		pullFrom = cfg.Pull.From
+	}
+	if pullFrom != "" && sinkPullInterval <= 0 {
 		return fmt.Errorf("--pull-interval must be greater than 0")
 	}
 
@@ -87,7 +106,7 @@ func runSink(cmd *cobra.Command, args []string) error {
 	// default baked in, OR a user hand-edited the file. Explicit
 	// 127.0.0.1 stays allowed for local-dev binding (operator typed it).
 	// Pull mode never binds, so listen.addr is unused.
-	if sinkPullFrom == "" {
+	if pullFrom == "" {
 		if err := validateListenAddr(cfg.Listen.Addr); err != nil {
 			return fmt.Errorf("sink listen %q: %w", cfg.Listen.Addr, err)
 		}
@@ -109,26 +128,9 @@ func runSink(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// v0.12.0-beta.3 headless mode: when skip_chrome_sqlite is true, the
-	// sink never touches Chrome Safe Storage. Sidecar + adapter push are
-	// still the cookie-delivery paths. Friends running on a fully headless
-	// Mac mini (no GUI session to answer Keychain prompts) opt in via
-	// wizard auto-detect.
-	var key []byte
-	switch {
-	case sinkDryRun:
-		fmt.Fprintln(os.Stderr, "agentcookie sink: --dry-run set; skipping Chrome Safe Storage and all write paths")
-	case cfg.SkipChromeSQLite:
-		fmt.Fprintln(os.Stderr, "agentcookie sink: skip_chrome_sqlite set; sidecar + adapter push only (no Chrome Safe Storage read, no Chrome SQLite write)")
-	default:
-		password, err := chrome.SafeStoragePassword()
-		if err != nil {
-			return fmt.Errorf("read Chrome Safe Storage from Keychain: %w (%s. To run sidecar+adapter only, set skip_chrome_sqlite: true in sink.yaml)", err, chrome.SafeStorageRemediation)
-		}
-		key, err = chrome.DeriveAESKey(password)
-		if err != nil {
-			return err
-		}
+	rt, err := newSinkRuntime(cfg)
+	if err != nil {
+		return err
 	}
 
 	// Log live CDP mode at startup (Linux sink's primary injection path).
@@ -145,6 +147,71 @@ func runSink(cmd *cobra.Command, args []string) error {
 	}
 
 	logSinkStartupBlocklistStatus()
+	registerCmuxSurface(cfg)
+
+	if pullFrom != "" {
+		pullURL, err := normalizePullURL(pullFrom)
+		if err != nil {
+			return err
+		}
+		client, err := pullHTTPClient(httpserver.PullClient, cfg.Pull.Proxy)
+		if err != nil {
+			return err
+		}
+		if sinkDryRun {
+			fmt.Fprintf(os.Stderr, "agentcookie sink: pull mode (dry-run); polling %s every %s (no /sync listener)\n", pullURL, sinkPullInterval)
+		} else {
+			fmt.Fprintf(os.Stderr, "agentcookie sink: pull mode; polling %s every %s (no /sync listener)\n", pullURL, sinkPullInterval)
+		}
+		return runSinkPullLoop(cmd.Context(), client, rt, transportSecret, pullURL, sinkPullInterval)
+	}
+
+	key, seqTracker, stateWriter, sinkState, stateMu := rt.key, rt.seq, rt.writer, rt.st, &rt.mu
+	mux := newSinkMux(cfg, transportSecret, key, seqTracker, stateWriter, sinkState, stateMu)
+
+	srv := httpserver.Configure(&http.Server{Addr: cfg.Listen.Addr, Handler: mux}, httpserver.SinkSync)
+	if sinkDryRun {
+		fmt.Fprintf(os.Stderr, "agentcookie sink: listening on http://%s (dry-run; no Chrome state will be modified)\n", cfg.Listen.Addr)
+	} else {
+		fmt.Fprintf(os.Stderr, "agentcookie sink: listening on http://%s (db=%s)\n", cfg.Listen.Addr, cfg.Chrome.DBPath)
+	}
+	return srv.ListenAndServe()
+}
+
+// sinkRuntime is the state one sink process applies envelopes with: the
+// Chrome key (nil when Chrome SQLite is skipped), the persistent replay
+// tracker, and the status file.
+type sinkRuntime struct {
+	cfg    *config.SinkConfig
+	key    []byte
+	seq    *protocol.SequenceTracker
+	writer *state.Writer
+	st     *state.SinkState
+	mu     sync.Mutex
+}
+
+func newSinkRuntime(cfg *config.SinkConfig) (*sinkRuntime, error) {
+	// v0.12.0-beta.3 headless mode: when skip_chrome_sqlite is true, the
+	// sink never touches Chrome Safe Storage. Sidecar + adapter push are
+	// still the cookie-delivery paths. Friends running on a fully headless
+	// Mac mini (no GUI session to answer Keychain prompts) opt in via
+	// wizard auto-detect.
+	var key []byte
+	switch {
+	case sinkDryRun:
+		fmt.Fprintln(os.Stderr, "agentcookie sink: --dry-run set; skipping Chrome Safe Storage and all write paths")
+	case cfg.SkipChromeSQLite:
+		fmt.Fprintln(os.Stderr, "agentcookie sink: skip_chrome_sqlite set; sidecar + adapter push only (no Chrome Safe Storage read, no Chrome SQLite write)")
+	default:
+		password, err := chrome.SafeStoragePassword()
+		if err != nil {
+			return nil, fmt.Errorf("read Chrome Safe Storage from Keychain: %w (%s. To run sidecar+adapter only, set skip_chrome_sqlite: true in sink.yaml)", err, chrome.SafeStorageRemediation)
+		}
+		key, err = chrome.DeriveAESKey(password)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Persistent replay-defense state. Survives sink restart so a
 	// captured /sync envelope cannot be replayed after a reboot. A
@@ -155,50 +222,37 @@ func runSink(cmd *cobra.Command, args []string) error {
 	seqStore := protocol.NewFileSequenceStore(protocol.DefaultSequencePath(home))
 	seqTracker, err := protocol.NewTrackerFromStore(seqStore)
 	if err != nil {
-		return fmt.Errorf("load replay-defense state: %w", err)
+		return nil, fmt.Errorf("load replay-defense state: %w", err)
 	}
 
 	// State writer for `agentcookie status` to read.
-	stateWriter := state.NewWriter(state.SinkPath(home))
-	sinkState := &state.SinkState{
-		Role:       "sink",
-		ListenAddr: cfg.Listen.Addr,
-	}
+	return &sinkRuntime{
+		cfg:    cfg,
+		key:    key,
+		seq:    seqTracker,
+		writer: state.NewWriter(state.SinkPath(home)),
+		st:     &state.SinkState{Role: "sink", ListenAddr: cfg.Listen.Addr},
+	}, nil
+}
 
-	// Opt-in cmux delivery surface (sink.yaml `cmux.enabled`). Registered
-	// here, not in sinkpush.init(), because it carries config (binary
-	// path, host filter) the package-load init cannot see. Once
-	// registered it fires after every sync via sinkpush.RunAll alongside
-	// the built-in per-CLI adapters, and shows up in `doctor` and
-	// `wizard verify-adapters` for free.
+// applier returns the envelope apply function shared by /sync and pull.
+func (rt *sinkRuntime) applier(ctx context.Context, transportSecret string) func([]byte) envelopeApplyResult {
+	return func(sealed []byte) envelopeApplyResult {
+		return applySealedEnvelope(ctx, rt.cfg, transportSecret, rt.key, rt.seq, rt.writer, rt.st, &rt.mu, sealed)
+	}
+}
+
+// registerCmuxSurface registers the opt-in cmux delivery surface (sink.yaml
+// `cmux.enabled`). Registered here, not in sinkpush.init(), because it
+// carries config (binary path, host filter) the package-load init cannot
+// see. Once registered it fires after every sync via sinkpush.RunAll
+// alongside the built-in per-CLI adapters, and shows up in `doctor` and
+// `wizard verify-adapters` for free. Call once per process.
+func registerCmuxSurface(cfg *config.SinkConfig) {
 	if cfg.Cmux.Enabled {
 		sinkpush.Register(sinkpush.NewCmux(cfg.Cmux.CmuxPath, cfg.Cmux.DomainFilter))
 		fmt.Fprintln(os.Stderr, "agentcookie sink: cmux delivery surface enabled")
 	}
-
-	var stateMu sync.Mutex
-	if sinkPullFrom != "" {
-		pullURL, err := normalizePullURL(sinkPullFrom)
-		if err != nil {
-			return err
-		}
-		if sinkDryRun {
-			fmt.Fprintf(os.Stderr, "agentcookie sink: pull mode (dry-run); polling %s every %s (no /sync listener)\n", pullURL, sinkPullInterval)
-		} else {
-			fmt.Fprintf(os.Stderr, "agentcookie sink: pull mode; polling %s every %s (no /sync listener)\n", pullURL, sinkPullInterval)
-		}
-		return runSinkPullLoop(cmd.Context(), cfg, transportSecret, key, seqTracker, stateWriter, sinkState, &stateMu, pullURL, sinkPullInterval)
-	}
-
-	mux := newSinkMux(cfg, transportSecret, key, seqTracker, stateWriter, sinkState, &stateMu)
-
-	srv := httpserver.Configure(&http.Server{Addr: cfg.Listen.Addr, Handler: mux}, httpserver.SinkSync)
-	if sinkDryRun {
-		fmt.Fprintf(os.Stderr, "agentcookie sink: listening on http://%s (dry-run; no Chrome state will be modified)\n", cfg.Listen.Addr)
-	} else {
-		fmt.Fprintf(os.Stderr, "agentcookie sink: listening on http://%s (db=%s)\n", cfg.Listen.Addr, cfg.Chrome.DBPath)
-	}
-	return srv.ListenAndServe()
 }
 
 func logSinkStartupBlocklistStatus() {

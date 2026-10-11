@@ -72,7 +72,24 @@ type SinkConfig struct {
 	LiveCDP          LiveCDPRef  `yaml:"live_cdp,omitempty" json:"live_cdp,omitempty"`
 	Cmux             CmuxRef     `yaml:"cmux,omitempty" json:"cmux,omitempty"`
 	Delivery         string      `yaml:"delivery,omitempty" json:"delivery,omitempty"`
+	// Pull makes this sink a puller (a teammate written by `agentcookie
+	// join`): it polls the pinned laptop's GET /pull and never binds a
+	// listener, so listen.addr is not required.
+	Pull PullRef `yaml:"pull,omitempty" json:"pull,omitempty"`
 }
+
+// PullRef configures pull mode. From is the laptop's pinned MagicDNS name
+// (host or host:port; the port defaults to 9998). Cadence is turn or
+// turn+timer. Proxy, when set, carries every pull and pairing request and
+// wins over HTTP_PROXY/HTTPS_PROXY.
+type PullRef struct {
+	From    string  `yaml:"from" json:"from"`
+	Cadence Cadence `yaml:"cadence,omitempty" json:"cadence,omitempty"`
+	Proxy   string  `yaml:"proxy,omitempty" json:"proxy,omitempty"`
+}
+
+// PullMode reports whether sink.yaml configures pull mode.
+func (c *SinkConfig) PullMode() bool { return c != nil && c.Pull.From != "" }
 
 // CmuxRef configures the cmux cookie-delivery surface (a fourth surface
 // alongside Chrome SQLite, the sidecar, and the per-CLI adapters). When
@@ -321,7 +338,14 @@ func LoadSink(dir string) (*SinkConfig, error) {
 	// further upstream. Empty here is now a config error; the wizard
 	// install writes a concrete tailnet 100.x address (see
 	// internal/tsclient.RequireTailnetIP).
-	if cfg.Listen.Addr == "" {
+	// Pull mode never binds, so it needs no listen.addr.
+	if cfg.PullMode() {
+		switch cfg.Pull.Cadence {
+		case "", CadenceTurn, CadenceTurnTimer:
+		default:
+			return nil, fmt.Errorf("%s: pull.cadence must be %q or %q (got %q)", path, CadenceTurn, CadenceTurnTimer, cfg.Pull.Cadence)
+		}
+	} else if cfg.Listen.Addr == "" {
 		return nil, fmt.Errorf("%s: listen.addr is required (run `agentcookie wizard install --as sink` to detect your Tailscale 100.x address, or set it explicitly)", path)
 	}
 	if cfg.Peer.Hostname == "" && cfg.Security.SharedSecret == "" {
