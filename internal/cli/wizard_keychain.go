@@ -4,6 +4,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -190,7 +191,10 @@ func runInlinePartitionAccess() error {
 // without touching the real Keychain.
 var (
 	countSafeStorageItemsFunc = chrome.CountSafeStorageItems
-	unlockKeychainFunc        = func(pw string) error {
+	// countSafeStorageItemsStrictFunc backs recreateValueForSafeStorage:
+	// a zero count it cannot vouch for is an error, never "no item".
+	countSafeStorageItemsStrictFunc = chrome.CountSafeStorageItemsStrict
+	unlockKeychainFunc              = func(pw string) error {
 		if pw == "" {
 			return nil // GUI session is already unlocked; nothing to do.
 		}
@@ -420,11 +424,20 @@ func buildStrategies(extraBinaries []string, enableSealing bool, anyApp bool) []
 			// in v0.12 because the PP CLI consumer-side of sealing
 			// (U12) has not shipped; turning sealing on without that
 			// would break v0.11 PP CLIs that read plaintext.
+			//
+			// COOKIE-SAFETY: like the -A strategy above, an existing item
+			// is recreated with its SAME value, and an existing item whose
+			// value cannot be read is never deleted. A different value
+			// would permanently destroy every existing Chrome cookie.
+			// Only a Mac with no item yet gets a fresh random value.
 			name: "delete-and-recreate-with-T",
 			apply: func() (string, error) {
+				pw, err := recreateValueForSafeStorage()
+				if err != nil {
+					return "", err
+				}
 				_, _ = execSecurityFunc("delete-generic-password",
 					"-s", "Chrome Safe Storage", "-a", "Chrome")
-				pw := randomKeychainPassword()
 				args := append([]string{
 					"add-generic-password",
 					"-s", "Chrome Safe Storage", "-a", "Chrome",
@@ -492,6 +505,29 @@ func agentcookieBinaryPath() string {
 		return exe
 	}
 	return resolved
+}
+
+// recreateValueForSafeStorage returns the value to recreate Chrome Safe
+// Storage with: the existing value when an item exists, or a fresh random
+// value when there is none. It refuses when an item exists but its value
+// cannot be read (or the item count is unknown), because recreating with a
+// different value would make every existing Chrome cookie unreadable.
+func recreateValueForSafeStorage() (string, error) {
+	n, err := countSafeStorageItemsStrictFunc()
+	if err != nil {
+		return "", fmt.Errorf("cannot count Chrome Safe Storage items (%w); refusing to recreate the item because a different value would permanently destroy all existing Chrome cookies", err)
+	}
+	if n == 0 {
+		return randomKeychainPassword(), nil
+	}
+	existing, err := safeStoragePasswordFunc()
+	if err == nil && existing == "" {
+		err = errors.New("the read returned an empty value")
+	}
+	if err != nil {
+		return "", fmt.Errorf("cannot read existing Chrome Safe Storage value (%w); refusing to delete the item because recreating it with a different value would permanently destroy all existing Chrome cookies. Do the one-time \"Always Allow\" grant in Keychain Access (see docs/runbook-v0.10-keychain-access.md), then re-run", err)
+	}
+	return existing, nil
 }
 
 // randomKeychainPassword returns 16 random bytes base64-encoded (~22 chars).
