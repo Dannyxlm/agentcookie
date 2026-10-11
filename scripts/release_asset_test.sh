@@ -702,14 +702,16 @@ if ! grep -qF "is missing the $APPLE_EVENTS_KEY entitlement" "$tmp/sign.err"; th
 fi
 assert_eq "$(run_sign_with_stub true)" "0" "sign.sh passes when the entitlement is true"
 
-# teammate-install.sh: pinned tag + pinned SHA256, from a local file://
-# release fixture (no network).
+# teammate-install.sh: pinned tag + one pinned SHA256 per Linux arch, from
+# a local file:// release fixture (no network). The installer picks the
+# digest for the host arch.
 AGENTCOOKIE_TEAMMATE_INSTALL_LIB_ONLY=1
 # shellcheck disable=SC1091
 source "$ROOT/scripts/teammate-install.sh"
 tm="$tmp/teammate"
 tm_tag="v9.8.7"
 tm_arch="$(teammate_linux_arch "$(uname -m)")"
+if [[ "$tm_arch" == "amd64" ]]; then tm_other_arch="arm64"; else tm_other_arch="amd64"; fi
 tm_asset="$(teammate_asset_name "$tm_tag" "$tm_arch")"
 assert_eq "$tm_asset" "agentcookie_9.8.7_linux_${tm_arch}.tar.gz" "teammate asset name"
 mkdir -p "$tm/release/$tm_tag" "$tm/stage"
@@ -718,6 +720,7 @@ chmod +x "$tm/stage/agentcookie"
 tar -czf "$tm/release/$tm_tag/$tm_asset" -C "$tm/stage" agentcookie
 tm_sha="$(teammate_sha256_of "$tm/release/$tm_tag/$tm_asset")"
 tm_bad_sha="$(printf '0%.0s' {1..64})"
+tm_other_sha="$(printf 'f%.0s' {1..64})"
 
 # run_teammate_install DEST ARGS...: prints the exit code; stderr to $tm/err.
 run_teammate_install() {
@@ -729,13 +732,33 @@ run_teammate_install() {
 }
 
 for ref in latest main HEAD 1.2.3 v1.2; do
-  assert_eq "$(run_teammate_install "$tm/bin-ref" "$ref" "$tm_sha")" "2" "teammate-install refuses unpinned ref $ref"
+  assert_eq "$(run_teammate_install "$tm/bin-ref" "$ref" "$tm_arch=$tm_sha")" "2" "teammate-install refuses unpinned ref $ref"
 done
 if [[ -e "$tm/bin-ref/agentcookie" ]]; then
   fail "teammate-install installed from an unpinned ref"
 fi
 
-assert_eq "$(run_teammate_install "$tm/bin-bad" "$tm_tag" "$tm_bad_sha")" "4" "teammate-install refuses a SHA256 mismatch"
+# Argument shape: a bare digest, an unknown arch, a short digest, and no
+# pin at all are refused before any download.
+for bad in "$tm_sha" "riscv64=$tm_sha" "$tm_arch=abc" "$tm_arch="; do
+  assert_eq "$(run_teammate_install "$tm/bin-arg" "$tm_tag" "$bad")" "2" "teammate-install refuses pin argument '$bad'"
+done
+assert_eq "$(run_teammate_install "$tm/bin-arg" "$tm_tag")" "2" "teammate-install refuses a tag with no pin"
+if [[ -e "$tm/bin-arg/agentcookie" ]]; then
+  fail "teammate-install installed with a malformed pin argument"
+fi
+
+# The host arch has no pin (e.g. a release with no arm64 asset): refuse
+# clearly, naming the arch.
+assert_eq "$(run_teammate_install "$tm/bin-noarch" "$tm_tag" "$tm_other_arch=$tm_other_sha")" "2" "teammate-install refuses a host arch with no pin"
+if [[ -e "$tm/bin-noarch/agentcookie" ]]; then
+  fail "teammate-install installed without a pin for the host arch"
+fi
+if ! grep -qF "no pinned SHA256 for linux/$tm_arch" "$tm/err"; then
+  fail "teammate-install did not name the unpinned host arch: $(cat "$tm/err")"
+fi
+
+assert_eq "$(run_teammate_install "$tm/bin-bad" "$tm_tag" "$tm_arch=$tm_bad_sha" "$tm_other_arch=$tm_sha")" "4" "teammate-install refuses a SHA256 mismatch"
 if [[ -e "$tm/bin-bad/agentcookie" ]]; then
   fail "teammate-install installed a binary whose SHA256 differs from the pinned value"
 fi
@@ -743,11 +766,11 @@ if ! grep -qF "SHA256 mismatch" "$tm/err"; then
   fail "teammate-install did not name the SHA256 mismatch"
 fi
 
-assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_sha")" "0" "teammate-install installs a pinned, matching asset"
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_other_arch=$tm_other_sha" "$tm_arch=$tm_sha")" "0" "teammate-install installs a pinned, matching asset for the host arch"
 if [[ ! -x "$tm/bin/agentcookie" ]] || [[ "$("$tm/bin/agentcookie")" != "agentcookie-teammate-fixture" ]]; then
   fail "teammate-install did not install the release binary as an executable"
 fi
-assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_sha")" "0" "teammate-install rerun replaces in place"
+assert_eq "$(run_teammate_install "$tm/bin" "$tm_tag" "$tm_arch=$tm_sha")" "0" "teammate-install rerun replaces in place"
 if compgen -G "$tm/bin/.agentcookie.new.*" >/dev/null; then
   fail "teammate-install left a temporary file behind"
 fi

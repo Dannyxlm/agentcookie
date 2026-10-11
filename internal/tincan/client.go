@@ -180,6 +180,10 @@ func (e *runError) Error() string {
 
 func (e *runError) Unwrap() error { return e.err }
 
+// waitDelay bounds how long run waits for tincan's output pipes after
+// the process exits or is killed.
+const waitDelay = 2 * time.Second
+
 // run executes tincan with args. It returns stdout even on a non-zero exit
 // so callers that print JSON before a status exit can still read it.
 func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
@@ -193,6 +197,9 @@ func (c *Client) run(ctx context.Context, args ...string) ([]byte, error) {
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, c.Path, args...)
+	// A child that outlives a killed tincan and holds its stdout open must
+	// not hang the lifecycle: stop waiting for the pipes 2s after the kill.
+	cmd.WaitDelay = waitDelay
 	cmd.Env = append(withoutEnv(os.Environ(), "TINCAN_CONFIG"), "TINCAN_CONFIG="+c.Config)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

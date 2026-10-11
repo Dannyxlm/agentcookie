@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
 # teammate-install.sh - Install the agentcookie Linux binary for a teammate
-# agent into ~/.local/bin, pinned to one release tag and one SHA256.
+# agent into ~/.local/bin, pinned to one release tag and one SHA256 per
+# Linux architecture.
 #
 # Usage:
-#   teammate-install.sh <tag> <sha256>
+#   teammate-install.sh <tag> <arch>=<sha256>...
+#   e.g. teammate-install.sh v1.4.0 amd64=<sha256> arm64=<sha256>
 #
-# The laptop pins both values into the pairing notice. The SHA256 is the
-# one the laptop computed from the release asset, so this script never
-# trusts a checksum fetched from the same place as the binary (no
-# checksums.txt). Unpinned refs such as latest or main are refused.
+# The laptop pins the tag and each digest into the pairing notice. Each
+# SHA256 is the one the laptop computed from that release asset, so this
+# script never trusts a checksum fetched from the same place as the binary
+# (no checksums.txt). The digest for this host's arch is used; a host arch
+# with no pin is refused, as are unpinned refs such as latest or main.
 #
 # The asset is agentcookie_<version>_linux_<arch>.tar.gz from the GitHub
 # release for <tag>. The binary is replaced atomically (same-directory
@@ -57,23 +60,44 @@ teammate_sha256_of() {
 }
 
 teammate_install() {
-  local tag="${1:-}" want="${2:-}"
-  if [[ -z "$tag" || -z "$want" ]]; then
-    echo "usage: teammate-install.sh <tag> <sha256>" >&2
+  local tag="${1:-}"
+  if [[ -z "$tag" || $# -lt 2 ]]; then
+    echo "usage: teammate-install.sh <tag> <arch>=<sha256>..." >&2
     return 2
   fi
+  shift
   if ! teammate_valid_tag "$tag"; then
     echo "teammate-install.sh: refusing unpinned or invalid release ref '$tag' (need an exact tag like v1.2.3)" >&2
     return 2
   fi
-  if ! teammate_valid_sha256 "$want"; then
-    echo "teammate-install.sh: the second argument must be the asset's 64-character SHA256" >&2
+
+  local arch want="" pin pin_arch pin_sha
+  arch="$(teammate_linux_arch "$(uname -m)")" || return 2
+  for pin in "$@"; do
+    if [[ "$pin" != *=* ]]; then
+      echo "teammate-install.sh: pin '$pin' must be <arch>=<sha256> (arch amd64 or arm64)" >&2
+      return 2
+    fi
+    pin_arch="${pin%%=*}"
+    pin_sha="${pin#*=}"
+    if [[ "$pin_arch" != "amd64" && "$pin_arch" != "arm64" ]]; then
+      echo "teammate-install.sh: unknown arch '$pin_arch' in pin '$pin' (need amd64 or arm64)" >&2
+      return 2
+    fi
+    if ! teammate_valid_sha256 "$pin_sha"; then
+      echo "teammate-install.sh: the $pin_arch pin must be the asset's 64-character SHA256" >&2
+      return 2
+    fi
+    if [[ "$pin_arch" == "$arch" ]]; then
+      want="$(printf '%s' "$pin_sha" | tr 'A-F' 'a-f')"
+    fi
+  done
+  if [[ -z "$want" ]]; then
+    echo "teammate-install.sh: no pinned SHA256 for linux/$arch in this install line; this release has no $arch build pinned, so nothing is installed (ask the owner for a release with a linux/$arch asset)" >&2
     return 2
   fi
-  want="$(printf '%s' "$want" | tr 'A-F' 'a-f')"
 
-  local arch asset base dest work got bin
-  arch="$(teammate_linux_arch "$(uname -m)")" || return 2
+  local asset base dest work got bin
   asset="$(teammate_asset_name "$tag" "$arch")"
   base="${AGENTCOOKIE_RELEASE_BASE_URL:-https://github.com/mvanhorn/agentcookie/releases/download}"
   dest="${AGENTCOOKIE_INSTALL_DIR:-$HOME/.local/bin}"

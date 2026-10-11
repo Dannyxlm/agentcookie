@@ -62,7 +62,7 @@ The first time a listed agent appears on a machine, the laptop shows one dialog 
 - Not now leaves the teammate waiting. The dialog does not come back until the daemon restarts or the agent shows up on another machine. An unanswered dialog closes itself after 12 hours, which counts as Not now.
 - With no GUI session (for example over SSH), a plain notification names the terminal equivalent: `agentcookie teammates approve <name> --node <stableid>`. `agentcookie teammates list` shows the same command.
 
-After approval the laptop sends the agent one Tincan notice with an install line (pinned to a release tag and the SHA256 of its Linux asset, which the laptop computed itself), a `join` command with a single-use code valid for 30 minutes, and the standing line. If the code expires before the agent uses it, a fresh one is sent the next time the agent checks Tincan, with no second approval.
+After approval the laptop sends the agent one Tincan notice with an install line (pinned to a release tag and the SHA256 of each Linux asset, amd64 and arm64, which the laptop computed itself), a `join` command with a single-use code valid for 30 minutes, and the standing line. If the code expires before the agent uses it, a fresh one is sent the next time the agent checks Tincan, with no second approval.
 
 ## The one standing line per agent
 
@@ -79,12 +79,12 @@ That is the only change to the agent. Everything else is in the notice.
 On the agent's machine, the notice's two commands are:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mvanhorn/agentcookie/<tag>/scripts/teammate-install.sh | bash -s -- <tag> <sha256>
+curl -fsSL https://raw.githubusercontent.com/mvanhorn/agentcookie/<tag>/scripts/teammate-install.sh | bash -s -- <tag> amd64=<sha256> arm64=<sha256>
 ~/.local/bin/agentcookie join --from your-mac.tail-xxxx.ts.net --code ABCD-EFGH-IJKL --as grokbot --cadence turn+timer
 ```
 
-- `teammate-install.sh` installs the release into `~/.local/bin`. It accepts only an exact release tag and refuses a binary whose SHA256 differs from the pinned one.
-- `join` writes a pull-mode `sink.yaml` (no listener), a sync-all `blocklist.yaml` if none exists, pins the laptop's name, pairs, and pulls once. It is idempotent. It refuses a different `--from` than the pinned laptop unless you pass `--replace`. The proxy is `--proxy`, else the `proxy` saved in the agent's Tincan `client.json`.
+- `teammate-install.sh` installs the release for the machine's arch (amd64 or arm64) into `~/.local/bin`. It accepts only an exact release tag, refuses a binary whose SHA256 differs from the one pinned for that arch, and refuses an arch the notice pins no SHA256 for (a release without a `linux_arm64` asset is pinned for amd64 only).
+- `join` writes a pull-mode `sink.yaml` (no listener, with `pull.as` set to `--as`), a sync-all `blocklist.yaml` if none exists, pins the laptop's name, pairs, and pulls once. It is idempotent. It refuses a different `--from` than the pinned laptop unless you pass `--replace`. The proxy is `--proxy`, else the `proxy` saved in the agent's Tincan `client.json`.
 - `agentcookie sink --pull-once` runs at the start of every turn. It holds `~/.agentcookie/pull.lock` (a second run exits 0 at once) and has a 45-second budget with connect retries, so it never hangs a turn.
 - Exit codes: 0 means cookies are current (applied, or nothing new); 3 means the laptop was unreachable within the budget (asleep, offline, or blocked), and existing cookies are untouched; 4 means this machine needs to re-pair (no local key, or the laptop refused it). The laptop starts that re-pair on its own.
 - For `turn+timer`, `--pull-once` also starts one detached pull loop if none is running, pulling every 5 to 15 minutes. A machine with no init system (grokbot) loses the loop on a wipe; the next turn's `--pull-once` starts it again. `$HOME` survives, so the binary and config stay.
@@ -111,7 +111,8 @@ agentcookie doctor
 ## Rebuilds and lost keys
 
 - Rebuild (the agent appears on a different Tailscale node): the old machine's access stops at once, and syncing resumes after one Approve on the laptop. The dialog says which machine the new one replaces.
-- Lost key on the same machine (for example a wiped config): the agent's next `--pull-once` exits 4 after a keyless pull to the laptop. The laptop sees that the request came from the approved machine and sends a fresh pairing notice with no dialog, at most once every 6 hours.
+- Rebuild also deletes the old machine's `keys/<name>.json` on the laptop.
+- Lost key on the same machine (for example a wiped config): the agent's next `--pull-once` exits 4 after a keyless pull to the laptop. The laptop sees that the request came from the approved machine and sends a fresh pairing notice with no dialog, at most once every 6 hours. The pull names the agent in an `X-Agentcookie-Teammate` header (from `pull.as` in `sink.yaml`), so when two agents share one machine only the one that lost its key is re-paired. Without the header (an older binary) the laptop re-pairs only when exactly one paired teammate is bound to that machine.
 
 ## Removing a teammate
 

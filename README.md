@@ -171,8 +171,8 @@ List your own Agent Tincan agents by name in `~/.config/agentcookie/teammates.ya
 An agent the laptop lists as a teammate does not use the setup above. It pulls from the laptop, so it needs no listener and no inbound access:
 
 ```bash
-# Install the pinned release (the laptop's pairing notice carries the tag and SHA256)
-bash teammate-install.sh v1.2.3 <sha256>
+# Install the pinned release (the laptop's pairing notice carries the tag and one SHA256 per arch)
+bash teammate-install.sh v1.2.3 amd64=<sha256> arm64=<sha256>
 
 # One-time setup, with the values from the notice
 ~/.local/bin/agentcookie join --from your-mac.tailnet.ts.net --code ABCD-EFGH-IJKL --as grokbot

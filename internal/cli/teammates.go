@@ -95,7 +95,9 @@ func (h *teammateHub) Reload() error {
 	h.mu.Lock()
 	h.present = present
 	h.loadErr = err
-	if err == nil {
+	if err == nil || (cfg != nil && errors.Is(err, errTeammatesStateUnavailable)) {
+		// A file that parsed is kept even when the state store is down,
+		// so its listed names stay classified as teammates (fail closed).
 		h.cfg = cfg
 	}
 	subs := append([]func(){}, h.onReload...)
@@ -189,6 +191,23 @@ func (h *teammateHub) IsListed(name string) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.loadErr == nil && h.present && h.cfg.Has(name)
+}
+
+// Unclassifiable reports whether teammate mode is present but a keystore
+// peer cannot be told apart from a teammate: the state store (which
+// remembers removed teammates and migrated peers) is unavailable, or no
+// teammates.yaml has loaded since the daemon started. Every keystore peer
+// is refused then (fail closed).
+func (h *teammateHub) Unclassifiable() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if !h.present {
+		return false
+	}
+	return h.store == nil || (h.loadErr != nil && h.cfg == nil)
 }
 
 // IsTeammateName reports whether name belongs to teammate mode now or ever

@@ -47,6 +47,13 @@ func ParseWhoIs(raw []byte) (*WhoIsResult, error) {
 	return res, nil
 }
 
+// whoisFindCLI locates the tailscale CLI for WhoIs; whoisTimeout bounds one
+// lookup. Tests replace both.
+var (
+	whoisFindCLI = FindCLI
+	whoisTimeout = 5 * time.Second
+)
+
 // WhoIs asks the local Tailscale daemon which node owns ip, via
 // `tailscale whois --json <ip>`. Callers that authorize on the answer must
 // treat any error as a refusal.
@@ -54,13 +61,17 @@ func WhoIs(ctx context.Context, ip string) (*WhoIsResult, error) {
 	if net.ParseIP(ip) == nil {
 		return nil, fmt.Errorf("tsclient: whois needs an IP address, got %q", ip)
 	}
-	cli, err := FindCLI()
+	cli, err := whoisFindCLI()
 	if err != nil {
 		return nil, err
 	}
-	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, whoisTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(runCtx, cli, "whois", "--json", ip).Output()
+	cmd := exec.CommandContext(runCtx, cli, "whois", "--json", ip)
+	// A child that outlives a killed tailscale and holds its stdout open
+	// must not hang /pull and /pair authorization.
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			return nil, fmt.Errorf("tsclient: %s whois %s: %w (%s)", cli, ip, err, strings.TrimSpace(string(exitErr.Stderr)))

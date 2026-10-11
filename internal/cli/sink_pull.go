@@ -64,7 +64,7 @@ func runSinkPullLoop(
 ) error {
 	apply := rt.applier(ctx, transportSecret)
 	return pullLoop(ctx, true, func() time.Duration { return interval }, func(ctx context.Context) error {
-		_, err := pullFromSource(ctx, client, pullURL, transportSecret, apply)
+		_, err := pullFromSource(ctx, client, pullURL, transportSecret, "", apply)
 		return err
 	})
 }
@@ -147,15 +147,20 @@ func pullHTTPClient(profile httpserver.Profile, proxy string) (*http.Client, err
 }
 
 func pollSourceOnce(ctx context.Context, pullURL, secret string, apply func([]byte) envelopeApplyResult) error {
-	_, err := pullFromSource(ctx, nil, pullURL, secret, apply)
+	_, err := pullFromSource(ctx, nil, pullURL, secret, "", apply)
 	return err
 }
+
+// teammateHeader names the teammate agent sending a /pull (sink.yaml
+// pull.as). It is not authenticated: the laptop uses it only to pick which
+// teammate bound to the caller's verified Tailscale node lost its key.
+const teammateHeader = "X-Agentcookie-Teammate"
 
 // pullFromSource runs one GET /pull and applies what it returns. A nil
 // client uses the stock pull client. An empty secret sends the request
 // unsigned: the keyless /pull a teammate with no key sends so the laptop
-// can start a re-pair.
-func pullFromSource(ctx context.Context, client *http.Client, pullURL, secret string, apply func([]byte) envelopeApplyResult) (pullOutcome, error) {
+// can start a re-pair. A non-empty as is sent in teammateHeader.
+func pullFromSource(ctx context.Context, client *http.Client, pullURL, secret, as string, apply func([]byte) envelopeApplyResult) (pullOutcome, error) {
 	if client == nil {
 		client = httpserver.Client(httpserver.PullClient)
 	}
@@ -173,6 +178,9 @@ func pullFromSource(ctx context.Context, client *http.Client, pullURL, secret st
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, resolved, nil)
 	if err != nil {
 		return pullNothingNew, fmt.Errorf("new request: %w", err)
+	}
+	if as != "" {
+		req.Header.Set(teammateHeader, as)
 	}
 	if secret != "" {
 		if err := transport.SignRequest(req, secret, time.Now()); err != nil {
@@ -324,7 +332,7 @@ func pullOnceLocked(ctx context.Context, cfg *config.SinkConfig) pullOnceResult 
 	if keyErr != nil || pk == nil || len(pk.Key) == 0 {
 		// One keyless GET /pull: from this machine's approved node it tells
 		// the laptop the key is lost, and the laptop starts a re-pair.
-		_, err := pullFromSource(budgetCtx, client, pullURL, "", func([]byte) envelopeApplyResult {
+		_, err := pullFromSource(budgetCtx, client, pullURL, "", cfg.Pull.As, func([]byte) envelopeApplyResult {
 			return envelopeApplyResult{Status: http.StatusUnauthorized, Reply: "no local key"}
 		})
 		summary := "no local key for " + cfg.Peer.Hostname + "; asked the laptop to re-pair (run the join command from its next notice)"
@@ -348,7 +356,7 @@ func pullOnceLocked(ctx context.Context, cfg *config.SinkConfig) pullOnceResult 
 
 	delay := pullOnceRetryMin
 	for {
-		outcome, err := pullFromSource(budgetCtx, client, pullURL, string(pk.Key), apply)
+		outcome, err := pullFromSource(budgetCtx, client, pullURL, string(pk.Key), cfg.Pull.As, apply)
 		if err == nil {
 			if outcome == pullApplied {
 				return pullOnceResult{summary: "applied fresh cookies from " + cfg.Pull.From}

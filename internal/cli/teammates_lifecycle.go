@@ -213,6 +213,10 @@ func (l *teammateLifecycle) execute(ctx context.Context, name string, a tmAction
 			l.logf("teammate %s: delete key: %v", name, err)
 			return
 		}
+		if a.NodeID != "" {
+			l.logf("teammate %s: a different machine carries this name now; deleted the key of the old machine %s (node %s)", name, a.NodeName, a.NodeID)
+			return
+		}
 		l.logf("teammate %s removed: its key is deleted and its next pull is refused. Cookies it already received stay valid on that machine until they expire or you sign out of those sites.", name)
 	case actCheckHold:
 		c, err := l.client()
@@ -272,6 +276,7 @@ func (l *teammateLifecycle) syncAll(ctx context.Context) {
 		}
 		delete(l.mem, name)
 	}
+	l.deleteStaleKeys()
 	if !l.hub.Active() {
 		return
 	}
@@ -285,6 +290,36 @@ func (l *teammateLifecycle) syncAll(ctx context.Context) {
 	for _, name := range l.hub.config().Names() {
 		a, ok := roster.Find(name)
 		_ = l.apply(ctx, name, tmEvent{Kind: evRoster, OnRoster: ok, Agent: a, CookiesChangedAt: changed})
+	}
+}
+
+// deleteStaleKeys deletes keys/<name>.json for every recorded teammate
+// that is no longer listed. Removal already deleted its key, but a /pair
+// that completed mid-removal can write one afterwards. Only names in the
+// teammate state are considered, so a non-teammate peer's key is never
+// touched. The caller has checked that teammates.yaml loaded.
+func (l *teammateLifecycle) deleteStaleKeys() {
+	snap := l.hub.store.Snapshot()
+	names := make([]string, 0, len(snap.Teammates))
+	for name, rec := range snap.Teammates {
+		if !rec.RemovedAt.IsZero() && !l.hub.IsListed(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		path, err := keystore.Path(l.hub.configDir, name)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		if err := keystore.Delete(l.hub.configDir, name); err != nil {
+			l.logf("teammate %s: delete stale key: %v", name, err)
+			continue
+		}
+		l.logf("teammate %s: deleted a key written after its removal (a pairing that finished mid-removal)", name)
 	}
 }
 
@@ -461,7 +496,7 @@ func (l *teammateLifecycle) pairingSend(ctx context.Context, name, nodeID string
 	}
 	text := pairingNoticeText(pairingNotice{
 		Name: name, Laptop: laptop, Code: string(code), Expires: expires,
-		Tag: pin.Tag, SHA256: pin.SHA256, Cadence: l.cadenceFor(name),
+		Tag: pin.Tag, SHA256: pin.SHA256, SHA256ARM64: pin.SHA256ARM64, Cadence: l.cadenceFor(name),
 	})
 	return c.Notify(ctx, name, text), expires
 }
@@ -495,17 +530,27 @@ func (l *teammateLifecycle) cadenceFor(name string) config.Cadence {
 }
 
 // releasePin returns the running release's tag and the SHA256 of its
-// Linux asset, computed once per release and kept in the state file.
+// linux_amd64 and linux_arm64 assets, computed once per release and kept
+// in the state file. A release with no arm64 asset is pinned for amd64
+// only; any other failure leaves the release unpinned so it is retried.
 func (l *teammateLifecycle) releasePin(ctx context.Context) (state.ReleasePin, error) {
 	tag := releaseTag(Version)
 	if snap := l.hub.store.Snapshot(); snap.ReleasePin != nil && snap.ReleasePin.Tag == tag && snap.ReleasePin.SHA256 != "" {
 		return *snap.ReleasePin, nil
 	}
-	sha, err := releaseSHA256Func(ctx, tag)
+	sha, err := releaseSHA256Func(ctx, tag, "amd64")
 	if err != nil {
 		return state.ReleasePin{}, fmt.Errorf("pin release %s for the install line: %w", tag, err)
 	}
-	pin := state.ReleasePin{Tag: tag, SHA256: sha}
+	arm, err := releaseSHA256Func(ctx, tag, "arm64")
+	if errors.Is(err, errReleaseAssetMissing) {
+		l.logf("teammates: release %s has no linux_arm64 asset; the install line pins amd64 only and an arm64 teammate cannot install it", tag)
+		arm, err = "", nil
+	}
+	if err != nil {
+		return state.ReleasePin{}, fmt.Errorf("pin release %s (arm64) for the install line: %w", tag, err)
+	}
+	pin := state.ReleasePin{Tag: tag, SHA256: sha, SHA256ARM64: arm}
 	if err := l.hub.store.Update(func(st *state.TeammatesState) error {
 		st.ReleasePin = &pin
 		return nil

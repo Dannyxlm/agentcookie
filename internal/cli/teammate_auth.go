@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -205,6 +208,10 @@ func (a *pullAuthorizer) authorizePull(r *http.Request) pullDecision {
 		}
 		return pullDecision{secret: matched}
 	}
+	if a.hub.Unclassifiable() {
+		fmt.Fprintf(a.hub.log, "agentcookie source: refused /pull with %s's key from %s: teammate state is unavailable, so it cannot be told apart from a teammate\n", peer.name, r.RemoteAddr)
+		return denyPull(http.StatusForbidden, "teammate state is unavailable; pulls are refused until it loads")
+	}
 	if !a.hub.IsTeammateName(peer.name) {
 		return pullDecision{secret: matched}
 	}
@@ -265,17 +272,21 @@ func (h *teammateHub) recordPull(name, errMsg string) {
 }
 
 // checkKeyLost raises TeammateKeyLost when an unauthenticated /pull comes
-// from the bound node of a listed, paired teammate. It never asks
-// Tailscale unless such a teammate exists.
+// from the bound node of a listed, paired teammate. Two agents may share
+// one machine, so the teammate is the one the X-Agentcookie-Teammate
+// header names (it must be bound and paired to the caller's node); with no
+// header it is the only paired teammate bound to that node, and with
+// several nothing is raised. It never asks Tailscale unless a paired
+// teammate exists.
 func (h *teammateHub) checkKeyLost(r *http.Request) {
 	if !h.Active() || h.Suspended() != nil || h.store == nil {
 		return
 	}
 	snap := h.store.Snapshot()
-	bound := map[string]string{} // node -> teammate
+	bound := map[string][]string{} // node -> paired teammates bound to it
 	for name, rec := range snap.Teammates {
 		if rec.BoundNodeID != "" && !rec.PairedAt.IsZero() && h.IsListed(name) {
-			bound[rec.BoundNodeID] = name
+			bound[rec.BoundNodeID] = append(bound[rec.BoundNodeID], name)
 		}
 	}
 	if len(bound) == 0 {
@@ -285,8 +296,23 @@ func (h *teammateHub) checkKeyLost(r *http.Request) {
 	if err != nil {
 		return
 	}
-	name, ok := bound[node.StableID]
-	if !ok {
+	names := bound[node.StableID]
+	if len(names) == 0 {
+		return
+	}
+	name := ""
+	if claimed := strings.TrimSpace(r.Header.Get(teammateHeader)); claimed != "" {
+		if !slices.Contains(names, claimed) {
+			fmt.Fprintf(h.log, "agentcookie source: keyless /pull from node %s names %q, which is not a paired teammate bound to that node; no re-pair\n", node.StableID, claimed)
+			return
+		}
+		name = claimed
+	} else if len(names) == 1 {
+		name = names[0]
+	} else {
+		sort.Strings(names)
+		fmt.Fprintf(h.log, "agentcookie source: keyless /pull from node %s, which several teammates share (%s), names no teammate; no re-pair (update agentcookie on that machine so its pulls send %s)\n",
+			node.StableID, strings.Join(names, ", "), teammateHeader)
 		return
 	}
 	h.emit(TeammateEvent{Kind: TeammateKeyLost, Name: name, NodeID: node.StableID, RemoteAddr: r.RemoteAddr, At: h.now()})

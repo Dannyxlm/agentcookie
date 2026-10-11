@@ -77,7 +77,7 @@ func TestJoinPairsWritesConfigAndPulls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("written sink.yaml does not load: %v", err)
 	}
-	if cfg.Pull.From != f.from || cfg.Pull.Cadence != config.CadenceTurn || cfg.Listen.Addr != "" || cfg.Peer.Hostname != "127.0.0.1" || !cfg.SkipChromeSQLite {
+	if cfg.Pull.From != f.from || cfg.Pull.As != "grokbot" || cfg.Pull.Cadence != config.CadenceTurn || cfg.Listen.Addr != "" || cfg.Peer.Hostname != "127.0.0.1" || !cfg.SkipChromeSQLite {
 		t.Fatalf("sink config = %+v", cfg)
 	}
 	if got := f.read(t, "blocklist.yaml"); got != teammateBlocklistYAML {

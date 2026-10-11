@@ -144,7 +144,7 @@ func joinTeammate(ctx context.Context, w io.Writer, opts joinOptions) error {
 	if opts.Replace && prevFrom != from {
 		raw = map[string]any{}
 	}
-	wantPull := map[string]any{"from": from, "cadence": cadence}
+	wantPull := map[string]any{"from": from, "cadence": cadence, "as": strings.TrimSpace(opts.As)}
 	if proxy != "" {
 		wantPull["proxy"] = proxy
 	}

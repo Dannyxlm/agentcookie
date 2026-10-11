@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,12 +29,19 @@ func teammateStandingLine() string {
 }
 
 // teammateInstallLine is the one-liner that installs or verifies the
-// pinned agentcookie release in ~/.local/bin. The installer checks the
-// Linux asset against sha256, which the laptop computed itself, so the
+// pinned agentcookie release in ~/.local/bin. It pins one SHA256 per Linux
+// asset (amd64=<sha> arm64=<sha>); the installer checks the asset for the
+// host's arch against its digest, which the laptop computed itself, so the
 // teammate never trusts a checksum from the same channel as the binary.
-func teammateInstallLine(tag, sha string) string {
+// An empty arm64 digest (the release has no arm64 asset) is left out, and
+// the installer then refuses an arm64 host.
+func teammateInstallLine(tag, amd64SHA, arm64SHA string) string {
+	pins := "amd64=" + amd64SHA
+	if arm64SHA != "" {
+		pins += " arm64=" + arm64SHA
+	}
 	return fmt.Sprintf("curl -fsSL https://raw.githubusercontent.com/%s/%s/scripts/teammate-install.sh | bash -s -- %s %s",
-		teammateRepo, tag, tag, sha)
+		teammateRepo, tag, tag, pins)
 }
 
 // pairingNotice is everything a pairing notify carries.
@@ -43,8 +51,11 @@ type pairingNotice struct {
 	Code    string
 	Expires time.Time
 	Tag     string
-	SHA256  string
-	Cadence config.Cadence
+	SHA256  string // linux_amd64 asset
+	// SHA256ARM64 is the linux_arm64 asset's digest; empty when the
+	// release has none.
+	SHA256ARM64 string
+	Cadence     config.Cadence
 }
 
 // pairingNoticeText is the body of a pairing notify: the pinned install
@@ -52,7 +63,7 @@ type pairingNotice struct {
 func pairingNoticeText(n pairingNotice) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "agentcookie join notice for %s: pair this machine with the owner's laptop %s so your browser stays logged in with the owner's cookies. Cookies travel over Tailscale from the laptop, never through Tincan.\n\n", n.Name, n.Laptop)
-	fmt.Fprintf(&b, "1. Install or verify agentcookie %s:\n%s\n\n", n.Tag, teammateInstallLine(n.Tag, n.SHA256))
+	fmt.Fprintf(&b, "1. Install or verify agentcookie %s:\n%s\n\n", n.Tag, teammateInstallLine(n.Tag, n.SHA256, n.SHA256ARM64))
 	fmt.Fprintf(&b, "2. Join (the code is single use and expires %s):\n%s join --from %s --code %s --as %s --cadence %s\n\n",
 		n.Expires.UTC().Format("15:04 MST"), teammateBinary, n.Laptop, n.Code, n.Name, n.Cadence)
 	fmt.Fprintf(&b, "3. Keep this line in your standing instructions:\n%s\n", teammateStandingLine())
@@ -85,20 +96,24 @@ func releaseTag(version string) string {
 	return "v" + strings.TrimPrefix(version, "v")
 }
 
-// linuxAssetURL is the Linux amd64 release archive for tag.
-func linuxAssetURL(tag string) string {
+// linuxAssetURL is the Linux release archive for tag and arch (amd64 or
+// arm64).
+func linuxAssetURL(tag, arch string) string {
 	ver := strings.TrimPrefix(tag, "v")
-	return fmt.Sprintf("https://github.com/%s/releases/download/%s/agentcookie_%s_linux_amd64.tar.gz", teammateRepo, tag, ver)
+	return fmt.Sprintf("https://github.com/%s/releases/download/%s/agentcookie_%s_linux_%s.tar.gz", teammateRepo, tag, ver, arch)
 }
 
-// releaseSHA256Func computes the SHA256 of tag's Linux release asset.
-// Production downloads it from GitHub; tests replace it.
+// errReleaseAssetMissing: the release has no asset for that arch (404).
+var errReleaseAssetMissing = errors.New("release asset not published")
+
+// releaseSHA256Func computes the SHA256 of tag's Linux release asset for
+// arch. Production downloads it from GitHub; tests replace it.
 var releaseSHA256Func = downloadReleaseSHA256
 
-func downloadReleaseSHA256(ctx context.Context, tag string) (string, error) {
+func downloadReleaseSHA256(ctx context.Context, tag, arch string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	url := linuxAssetURL(tag)
+	url := linuxAssetURL(tag, arch)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -108,6 +123,9 @@ func downloadReleaseSHA256(ctx context.Context, tag string) (string, error) {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("download %s: %w (is %s a published release?)", url, errReleaseAssetMissing, tag)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download %s: HTTP %d (is %s a published release?)", url, resp.StatusCode, tag)
 	}

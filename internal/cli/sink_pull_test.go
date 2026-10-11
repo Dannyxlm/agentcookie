@@ -179,6 +179,7 @@ type teammateSink struct {
 	laptop    *httptest.Server
 	hits      atomic.Int32
 	keyless   atomic.Int32
+	asHeader  atomic.Value // last X-Agentcookie-Teammate seen
 	envSeq    atomic.Int64
 	status    atomic.Int32 // non-zero: answer every /pull with this status
 	gate      chan struct{}
@@ -212,6 +213,7 @@ func newTeammateSink(t *testing.T, cadence, proxy string) *teammateSink {
 		if r.Header.Get(transport.HeaderMAC) == "" {
 			ts.keyless.Add(1)
 		}
+		ts.asHeader.Store(r.Header.Get("X-Agentcookie-Teammate"))
 		if s := ts.status.Load(); s != 0 {
 			http.Error(w, "refused", int(s))
 			return
@@ -235,7 +237,7 @@ func newTeammateSink(t *testing.T, cadence, proxy string) *teammateSink {
 	t.Cleanup(ts.laptop.Close)
 
 	from := strings.TrimPrefix(ts.laptop.URL, "http://")
-	yml := "pull:\n  from: " + from + "\n  cadence: " + cadence + "\n"
+	yml := "pull:\n  from: " + from + "\n  cadence: " + cadence + "\n  as: grokbot\n"
 	if proxy != "" {
 		yml += "  proxy: " + proxy + "\n"
 	}
@@ -345,6 +347,11 @@ func TestPullOnceWithoutKeySendsOneKeylessPullAndExits4(t *testing.T) {
 	}
 	if ts.hits.Load() != 1 || ts.keyless.Load() != 1 {
 		t.Fatalf("hits=%d keyless=%d, want exactly one keyless /pull", ts.hits.Load(), ts.keyless.Load())
+	}
+	// The keyless /pull names this agent so a laptop with two teammates on
+	// one machine knows whose key was lost.
+	if got, _ := ts.asHeader.Load().(string); got != "grokbot" {
+		t.Fatalf("X-Agentcookie-Teammate = %q, want grokbot (pull.as from sink.yaml)", got)
 	}
 }
 

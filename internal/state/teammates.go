@@ -44,7 +44,7 @@ type TeammatesState struct {
 	// Tailscale. Pairing notices pin it as the laptop teammates pull from.
 	LaptopDNSName string `json:"laptop_dns_name,omitempty"`
 	// ReleasePin is the release a pairing notice installs, with the SHA256
-	// of its Linux asset, computed once per release.
+	// of each Linux asset, computed once per release.
 	ReleasePin *ReleasePin `json:"release_pin,omitempty"`
 }
 
@@ -64,8 +64,12 @@ type TincanStatus struct {
 
 // ReleasePin is the agentcookie release a teammate installs.
 type ReleasePin struct {
-	Tag    string `json:"tag"`
+	Tag string `json:"tag"`
+	// SHA256 is the linux_amd64 asset's digest.
 	SHA256 string `json:"sha256"`
+	// SHA256ARM64 is the linux_arm64 asset's digest; empty when the
+	// release has no arm64 asset.
+	SHA256ARM64 string `json:"sha256_arm64,omitempty"`
 }
 
 // Teammate lifecycle phases (TeammateRecord.Phase).

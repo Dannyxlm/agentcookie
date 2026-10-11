@@ -16,7 +16,7 @@ import (
 func TestPairingNoticeMatchesJoinAndInstaller(t *testing.T) {
 	text := pairingNoticeText(pairingNotice{
 		Name: "grokbot", Laptop: "macbook-pro-44", Code: "ABCD-EFGH",
-		Expires: time.Unix(0, 0), Tag: "v9.9.9", SHA256: strings.Repeat("a", 64),
+		Expires: time.Unix(0, 0), Tag: "v9.9.9", SHA256: strings.Repeat("a", 64), SHA256ARM64: strings.Repeat("b", 64),
 		Cadence: config.CadenceTurnTimer,
 	})
 
@@ -46,11 +46,15 @@ func TestPairingNoticeMatchesJoinAndInstaller(t *testing.T) {
 		}
 	}
 
-	// The installer takes the tag and SHA256 as positional arguments and is
-	// a bash script; run it in its argument-validation-only mode by giving
-	// it an unpinned tag through the same invocation shape.
-	if !strings.Contains(installLine, "| bash -s -- v9.9.9 "+strings.Repeat("a", 64)) {
-		t.Errorf("install line does not pass <tag> <sha256> positionally to bash: %s", installLine)
+	// The installer takes the tag and one <arch>=<sha256> per pinned Linux
+	// asset as positional arguments and is a bash script; run it in its
+	// argument-validation-only mode by giving it an unpinned tag through
+	// the same invocation shape.
+	if !strings.HasSuffix(installLine, "| bash -s -- v9.9.9 amd64="+strings.Repeat("a", 64)+" arm64="+strings.Repeat("b", 64)) {
+		t.Errorf("install line does not pass <tag> amd64=<sha256> arm64=<sha256> positionally to bash: %s", installLine)
+	}
+	if got := teammateInstallLine("v9.9.9", strings.Repeat("a", 64), ""); !strings.HasSuffix(got, "| bash -s -- v9.9.9 amd64="+strings.Repeat("a", 64)) {
+		t.Errorf("install line without an arm64 pin: %s", got)
 	}
 	script, err := filepath.Abs(filepath.Join("..", "..", "scripts", "teammate-install.sh"))
 	if err != nil {
@@ -59,7 +63,7 @@ func TestPairingNoticeMatchesJoinAndInstaller(t *testing.T) {
 	if _, err := os.Stat(script); err != nil {
 		t.Skipf("installer not found: %v", err)
 	}
-	cmd := exec.Command("bash", "-s", "--", "latest", strings.Repeat("a", 64))
+	cmd := exec.Command("bash", "-s", "--", "latest", "amd64="+strings.Repeat("a", 64), "arm64="+strings.Repeat("b", 64))
 	src, err := os.ReadFile(script)
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +73,6 @@ func TestPairingNoticeMatchesJoinAndInstaller(t *testing.T) {
 	err = cmd.Run()
 	exitErr, ok := err.(*exec.ExitError)
 	if !ok || exitErr.ExitCode() != 2 {
-		t.Errorf("installer run as `bash -s -- <tag> <sha>` with an unpinned tag: err=%v, want exit 2 (argument check reached)", err)
+		t.Errorf("installer run as `bash -s -- <tag> <arch>=<sha>...` with an unpinned tag: err=%v, want exit 2 (argument check reached)", err)
 	}
 }

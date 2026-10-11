@@ -103,7 +103,8 @@ const (
 	actCancelNotify
 	// actCancelPairing: drop the teammate's pending code.
 	actCancelPairing
-	// actDeleteKey: delete keys/<name>.json.
+	// actDeleteKey: delete keys/<name>.json. NodeID set: the key of that
+	// previously bound machine (node change), not a removal.
 	actDeleteKey
 	// actCheckHold: read RequestID's status; answered with evHoldStatus.
 	actCheckHold
@@ -176,13 +177,7 @@ func stepTeammate(s tmState, ev tmEvent, now time.Time) (tmState, []tmAction, er
 		if r.BoundNodeID == "" || ev.NodeID != r.BoundNodeID {
 			break
 		}
-		r.Phase = state.PhasePaired
-		r.PairCodeMissedAt = time.Time{}
-		if r.NotifyPurpose == state.NotifyPurposePairing {
-			acts = append(acts, cancelOpenNotify(r)...)
-		}
-		r.CodeExpiresAt = time.Time{}
-		m.CodeLive, m.HoldReminted = false, false
+		acts = markPaired(r, m)
 	case evKeyLost:
 		if r.Phase != state.PhasePaired || ev.NodeID == "" || ev.NodeID != r.BoundNodeID {
 			break
@@ -226,8 +221,9 @@ func stepRoster(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time) []
 	}
 	if r.BoundNodeID != "" && nodeID != r.BoundNodeID {
 		// A different machine now carries this name (rebuild). The old
-		// binding stops at once; the new one needs the owner's approval.
-		acts = append(acts, tmAction{Kind: actCancelPairing})
+		// binding stops at once and the old machine's key is deleted; the
+		// new one needs the owner's approval.
+		acts = append(acts, tmAction{Kind: actCancelPairing}, tmAction{Kind: actDeleteKey, NodeID: r.BoundNodeID, NodeName: r.BoundNodeName})
 		acts = append(acts, cancelOpenNotify(r)...)
 		r.ReplacesNodeID, r.ReplacesNodeName = r.BoundNodeID, r.BoundNodeName
 		unbind(r)
@@ -254,6 +250,11 @@ func stepRoster(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time) []
 func maintain(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time) []tmAction {
 	switch r.Phase {
 	case state.PhasePairing:
+		if pairedSinceMint(*r) {
+			// The paired event was dropped (full event queue); the
+			// record shows the /pair completed, so catch up.
+			return markPaired(r, m)
+		}
 		if m.CodeLive || now.Before(m.BackoffUntil) {
 			return nil
 		}
@@ -384,6 +385,29 @@ func stepHoldStatus(r *state.TeammateRecord, m *tmMem, ev tmEvent, now time.Time
 		r.Phase = state.PhasePairing
 		return pairingNotify(r)
 	}
+}
+
+// markPaired moves a bound teammate to paired and closes its pairing
+// notify.
+func markPaired(r *state.TeammateRecord, m *tmMem) []tmAction {
+	var acts []tmAction
+	r.Phase = state.PhasePaired
+	r.PairCodeMissedAt = time.Time{}
+	if r.NotifyPurpose == state.NotifyPurposePairing {
+		acts = append(acts, cancelOpenNotify(r)...)
+	}
+	r.CodeExpiresAt = time.Time{}
+	m.CodeLive, m.HoldReminted = false, false
+	return acts
+}
+
+// pairedSinceMint reports whether a /pair from the bound node completed
+// for the current pairing round: PairedAt is set, not older than the
+// latest minted code, and newer than the last lost-key re-pair (which
+// keeps the previous PairedAt until the new /pair lands).
+func pairedSinceMint(r state.TeammateRecord) bool {
+	return r.BoundNodeID != "" && !r.PairedAt.IsZero() &&
+		!r.PairedAt.Before(r.PairCodeMintedAt) && r.PairedAt.After(r.LastRepairAt)
 }
 
 // pairNoticeUnanswered reports whether r's pairing notice reached the

@@ -419,3 +419,165 @@ func TestWhoisCacheDoesNotRememberCanceledLookup(t *testing.T) {
 		t.Fatalf("WhoIs calls = %d, want 2", calls)
 	}
 }
+
+// newNilStoreAuthFixture is a daemon whose teammates-state.json could not
+// be opened (nil store) with teammates.yaml set to body and keys for
+// grokbot and muse-box.
+func newNilStoreAuthFixture(t *testing.T, body string) *authFixture {
+	t.Helper()
+	dir := t.TempDir()
+	withConfigDir(t, dir)
+	writeTeammatesFile(t, dir, body)
+	for peer, key := range map[string]string{"grokbot": grokKey, musePeer: museKey} {
+		if err := keystore.Save(dir, &keystore.PeerKey{Peer: peer, Key: []byte(key)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hub := newTeammateHub(dir, nil, nil)
+	hub.log = &strings.Builder{}
+	_ = hub.Reload()
+	cache := newPullCache()
+	cache.Store([]byte(testEnvJSON))
+	return &authFixture{
+		dir:   dir,
+		hub:   hub,
+		whois: installFakeWhoIs(t),
+		cache: cache,
+		h:     newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, hub)),
+	}
+}
+
+// Fail closed: with teammates.yaml present but the state store
+// unavailable, a listed name's key is refused and never falls through to
+// the non-teammate rule; neither does any other keystore peer, since a
+// removed teammate cannot be told apart without the store.
+func TestTeammatePullRefusedWhenStateStoreUnavailable(t *testing.T) {
+	f := newNilStoreAuthFixture(t, "teammates:\n  - name: grokbot\n")
+	if !f.hub.IsTeammateName("grokbot") {
+		t.Fatal("a listed name must stay classified while the state store is unavailable")
+	}
+	if rec := f.pull(t, grokKey, strangerIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("listed teammate from an unbound node with no state store: status = %d, want 403", rec.Code)
+	}
+	if rec := f.pull(t, grokKey, grokIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("listed teammate with no state store: status = %d, want 403", rec.Code)
+	}
+	if rec := f.pull(t, museKey, strangerIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("keystore peer while classification is impossible: status = %d, want 403", rec.Code)
+	}
+}
+
+// Fail closed: a teammates.yaml that never loaded (parse error at start,
+// no state store) still refuses the key of a name it lists.
+func TestTeammatePullRefusedWhenSuspendedWithoutStore(t *testing.T) {
+	f := newNilStoreAuthFixture(t, "teammates:\n  - name: grokbot\n  - name: [\n")
+	if f.hub.Suspended() == nil {
+		t.Fatal("hub should be suspended")
+	}
+	if rec := f.pull(t, grokKey, grokIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("suspended, listed name's key: status = %d, want 403", rec.Code)
+	}
+}
+
+// Fail closed: a teammates.yaml that is broken from the daemon's start
+// (no good list ever loaded) leaves every keystore peer unclassifiable, so
+// a key for a name the broken file lists is refused even with a state
+// store.
+func TestTeammatePullRefusedWhenNeverLoaded(t *testing.T) {
+	dir := t.TempDir()
+	withConfigDir(t, dir)
+	writeTeammatesFile(t, dir, "teammates:\n  - name: grokbot\n  - name: [\n")
+	if err := keystore.Save(dir, &keystore.PeerKey{Peer: "grokbot", Key: []byte(grokKey)}); err != nil {
+		t.Fatal(err)
+	}
+	hub, _ := newTestHub(t, dir)
+	_ = hub.Reload()
+	installFakeWhoIs(t)
+	cache := newPullCache()
+	cache.Store([]byte(testEnvJSON))
+	f := &authFixture{dir: dir, hub: hub, cache: cache, h: newPullHandlerWithAuth(cache, newPullAuthorizer(dir, legacyKey, hub))}
+	if rec := f.pull(t, grokKey, grokIP); rec.Code != http.StatusForbidden {
+		t.Fatalf("never-loaded teammates.yaml: status = %d, want 403", rec.Code)
+	}
+}
+
+// keylessPullAs sends an unsigned /pull from ip, naming as in the
+// X-Agentcookie-Teammate header when it is not empty.
+func (f *authFixture) keylessPullAs(t *testing.T, ip, as string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/pull", nil)
+	req.RemoteAddr = ip + ":41000"
+	if as != "" {
+		req.Header.Set("X-Agentcookie-Teammate", as)
+	}
+	rec := httptest.NewRecorder()
+	f.h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+func drainEvents(hub *teammateHub) []TeammateEvent {
+	var out []TeammateEvent
+	for {
+		select {
+		case ev := <-hub.Events():
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
+// Two agents on one machine: the keyless /pull names the agent whose key
+// was lost, and only that teammate is re-paired.
+func TestKeylessPullOnSharedNodeUsesTeammateHeader(t *testing.T) {
+	f := newAuthFixture(t, "teammates:\n  - name: grokbot\n  - name: dot\n  - name: other\n")
+	bindTeammate(t, f.hub, "dot", grokNode, true)
+	bindTeammate(t, f.hub, "other", otherNode, true)
+
+	if code := f.keylessPullAs(t, grokIP, "dot"); code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", code)
+	}
+	evs := drainEvents(f.hub)
+	if len(evs) != 1 || evs[0].Kind != TeammateKeyLost || evs[0].Name != "dot" || evs[0].NodeID != grokNode {
+		t.Fatalf("events = %+v, want one key-lost for dot", evs)
+	}
+
+	// A header naming a teammate bound to a different node raises nothing.
+	f.keylessPullAs(t, grokIP, "other")
+	if evs := drainEvents(f.hub); len(evs) != 0 {
+		t.Fatalf("header naming another node's teammate raised %+v", evs)
+	}
+	// So does a header naming nobody listed.
+	f.keylessPullAs(t, grokIP, "stranger")
+	if evs := drainEvents(f.hub); len(evs) != 0 {
+		t.Fatalf("header naming an unlisted agent raised %+v", evs)
+	}
+}
+
+// Two paired teammates bound to one node and no header: the key-lost
+// owner is ambiguous, so nothing is raised and the ambiguity is logged.
+func TestKeylessPullOnSharedNodeWithoutHeaderIsAmbiguous(t *testing.T) {
+	f := newAuthFixture(t, "teammates:\n  - name: grokbot\n  - name: dot\n")
+	var logBuf strings.Builder
+	f.hub.log = &logBuf
+	bindTeammate(t, f.hub, "dot", grokNode, true)
+	if code := f.keylessPullAs(t, grokIP, ""); code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", code)
+	}
+	if evs := drainEvents(f.hub); len(evs) != 0 {
+		t.Fatalf("ambiguous keyless pull raised %+v", evs)
+	}
+	if !strings.Contains(logBuf.String(), "dot") || !strings.Contains(logBuf.String(), "grokbot") {
+		t.Fatalf("ambiguity not logged: %q", logBuf.String())
+	}
+
+	// With only one of them paired, the unpaired one does not count.
+	_ = f.hub.store.Update(func(st *state.TeammatesState) error {
+		st.Teammate("dot").PairedAt = time.Time{}
+		return nil
+	})
+	f.keylessPullAs(t, grokIP, "")
+	if evs := drainEvents(f.hub); len(evs) != 1 || evs[0].Name != "grokbot" {
+		t.Fatalf("events = %+v, want one key-lost for grokbot", evs)
+	}
+}

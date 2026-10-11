@@ -265,9 +265,12 @@ func TestStepNodeChangeOnPaired(t *testing.T) {
 	if s.Rec.PendingNodeID != "nNEW" || s.Rec.ReplacesNodeID != "nGROK" || s.Rec.ReplacesNodeName != "grok-bot" {
 		t.Fatalf("rec = %+v", s.Rec)
 	}
-	wantActs(t, acts, actCancelPairing, actCancelNotify, actDialog)
-	if acts[2].NodeID != "nNEW" || acts[2].Replaces != "grok-bot" {
-		t.Fatalf("dialog = %+v", acts[2])
+	wantActs(t, acts, actCancelPairing, actDeleteKey, actCancelNotify, actDialog)
+	if acts[1].NodeID != "nGROK" {
+		t.Fatalf("delete key = %+v, want the old node's key", acts[1])
+	}
+	if acts[3].NodeID != "nNEW" || acts[3].Replaces != "grok-bot" {
+		t.Fatalf("dialog = %+v", acts[3])
 	}
 	_, acts = mustStep(t, s, rosterEv(nodeAgent("nNEW", "grok-bot-2")), stepT0.Add(2*time.Hour))
 	wantActs(t, acts)
@@ -286,7 +289,7 @@ func TestStepNodeChangeWhilePairing(t *testing.T) {
 	if s.Rec.Phase != state.PhaseAwaitingApproval || s.Rec.BoundNodeID != "" || s.Mem.CodeLive {
 		t.Fatalf("state = %+v", s)
 	}
-	wantActs(t, acts, actCancelPairing, actCancelNotify, actDialog)
+	wantActs(t, acts, actCancelPairing, actDeleteKey, actCancelNotify, actDialog)
 }
 
 // Node fields vanishing (relay downgraded) never unbinds a teammate.
@@ -477,4 +480,57 @@ func TestStepRemintKeepsMissedCode(t *testing.T) {
 	if !s.Rec.PairCodeMissedAt.IsZero() {
 		t.Fatal("paired must clear pair_code_missed_at")
 	}
+}
+
+// A dropped paired event (full event queue) self-heals: a record still in
+// pairing whose /pair completed after its code was minted moves to paired
+// on the next roster poll, closing the pairing notify.
+func TestStepPairingWithPairedAtSelfHeals(t *testing.T) {
+	s := pairingState()
+	s.Rec.PairCodeMintedAt = stepT0
+	s.Rec.PairedAt = stepT0.Add(time.Minute)
+	s.Mem.CodeLive = false
+	s, acts := mustStep(t, s, rosterEv(nodeAgent("nGROK", "grok-bot")), stepT0.Add(10*time.Minute))
+	if s.Rec.Phase != state.PhasePaired || s.Rec.NotifyID != "" || !s.Rec.CodeExpiresAt.IsZero() {
+		t.Fatalf("rec = %+v", s.Rec)
+	}
+	wantActs(t, acts, actCancelNotify)
+
+	// The same with the node fields gone from the roster.
+	s = pairingState()
+	s.Rec.PairCodeMintedAt = stepT0
+	s.Rec.PairedAt = stepT0.Add(time.Minute)
+	s, _ = mustStep(t, s, rosterEv(tincan.Agent{Name: "grokbot"}), stepT0.Add(10*time.Minute))
+	if s.Rec.Phase != state.PhasePaired {
+		t.Fatalf("phase = %q", s.Rec.Phase)
+	}
+
+	// A re-pair after a lost key keeps the old PairedAt until the new
+	// /pair lands: that must not count as paired.
+	s, _ = mustStep(t, pairedState(), tmEvent{Kind: evKeyLost, NodeID: "nGROK"}, stepT0.Add(time.Hour))
+	s.Rec.PairCodeMintedAt = stepT0.Add(time.Hour)
+	s, _ = mustStep(t, s, rosterEv(nodeAgent("nGROK", "grok-bot")), stepT0.Add(2*time.Hour))
+	if s.Rec.Phase != state.PhasePairing {
+		t.Fatalf("re-pairing with an old PairedAt moved to %q", s.Rec.Phase)
+	}
+	// Even when minting the new code failed (PairCodeMintedAt is old).
+	s, _ = mustStep(t, pairedState(), tmEvent{Kind: evKeyLost, NodeID: "nGROK"}, stepT0.Add(time.Hour))
+	s, _ = mustStep(t, s, rosterEv(nodeAgent("nGROK", "grok-bot")), stepT0.Add(2*time.Hour))
+	if s.Rec.Phase != state.PhasePairing {
+		t.Fatalf("re-pairing after a failed mint moved to %q", s.Rec.Phase)
+	}
+}
+
+// A paired event for a node other than the bound one never marks paired.
+func TestStepPairedEventFromOtherNodeIgnored(t *testing.T) {
+	s, acts := mustStep(t, pairingState(), tmEvent{Kind: evPaired, NodeID: "nOTHER"}, stepT0.Add(time.Minute))
+	if s.Rec.Phase != state.PhasePairing || s.Rec.NotifyID != "r-1" || !s.Mem.CodeLive {
+		t.Fatalf("state = %+v", s)
+	}
+	wantActs(t, acts)
+	s, acts = mustStep(t, tmState{Rec: state.TeammateRecord{Phase: state.PhaseAwaitingApproval, PendingNodeID: "nGROK"}}, tmEvent{Kind: evPaired, NodeID: "nGROK"}, stepT0)
+	if s.Rec.Phase != state.PhaseAwaitingApproval {
+		t.Fatalf("unbound record marked %q", s.Rec.Phase)
+	}
+	wantActs(t, acts)
 }

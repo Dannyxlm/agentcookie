@@ -298,3 +298,82 @@ func TestPairRouteRecordsAttempts(t *testing.T) {
 		t.Fatal("another teammate's record must not change")
 	}
 }
+
+// A teammate removed from teammates.yaml after its code was minted is
+// refused: no key is filed and its pending code is dropped.
+func TestPairRouteRefusesTeammateRemovedAfterMint(t *testing.T) {
+	f := newPairFixture(t, grokNode)
+	code, _, err := f.hub.MintPairing("grokbot", grokNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTeammatesFile(t, f.dir, "teammates:\n  - name: instinct\n")
+	if err := f.hub.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.runSink(code); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("removed teammate's /pair should get 403, got %v", err)
+	}
+	if _, err := keystore.Load(f.dir, "grokbot"); err == nil {
+		t.Fatal("a key was filed for a removed teammate")
+	}
+	for _, p := range f.hub.PendingPairings() {
+		if p.Name == "grokbot" {
+			t.Fatal("the removed teammate's pending code was not cleared")
+		}
+	}
+}
+
+// A code minted for the previous binding is refused once the record is
+// bound to another node, and no key is filed.
+func TestPairRouteRefusesReboundRecord(t *testing.T) {
+	f := newPairFixture(t, grokNode)
+	code, _, err := f.hub.MintPairing("grokbot", grokNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindTeammate(t, f.hub, "grokbot", "nREBUILT", false)
+	if _, err := f.runSink(code); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("/pair for a rebound record should get 403, got %v", err)
+	}
+	if _, err := keystore.Load(f.dir, "grokbot"); err == nil {
+		t.Fatal("a key was filed for a rebound record")
+	}
+	for _, p := range f.hub.PendingPairings() {
+		if p.Name == "grokbot" {
+			t.Fatal("the stale pending code was not cleared")
+		}
+	}
+}
+
+// One code used twice at once: exactly one pairing succeeds; the other is
+// refused as already used (409) or no longer pending (401).
+func TestPairRouteConcurrentUseOfOneCode(t *testing.T) {
+	f := newPairFixture(t, grokNode)
+	code, _, err := f.hub.MintPairing("grokbot", grokNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = f.runSink(code)
+		})
+	}
+	wg.Wait()
+	ok, refused := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case strings.Contains(err.Error(), "409") || strings.Contains(err.Error(), "401"):
+			refused++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	if ok != 1 || refused != 1 {
+		t.Fatalf("successes = %d, refusals = %d (errs %v); want exactly one of each", ok, refused, errs)
+	}
+}

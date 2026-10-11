@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,7 @@ type lcHarness struct {
 	mu      sync.Mutex
 	dialogs []notify.ApprovalRequest
 	answer  bool
+	noARM64 bool // the release has no linux_arm64 asset
 }
 
 const lcTincanConfig = "/cfg/tincan/agentcookie.json"
@@ -59,7 +61,15 @@ func newLCHarness(t *testing.T, names ...string) *lcHarness {
 	}
 	ownerNoticeFunc = func(context.Context, string, string) error { return nil }
 	laptopDNSNameFunc = func(context.Context) (string, error) { return "mac-laptop.tail2b6977.ts.net", nil }
-	releaseSHA256Func = func(_ context.Context, tag string) (string, error) {
+	releaseSHA256Func = func(_ context.Context, tag, arch string) (string, error) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.noARM64 && arch == "arm64" {
+			return "", errReleaseAssetMissing
+		}
+		if arch == "arm64" {
+			return "cd34" + strings.Repeat("0", 60), nil
+		}
 		return "ab12" + strings.Repeat("0", 60), nil
 	}
 	Version = "1.4.0"
@@ -169,7 +179,7 @@ func TestLifecycleFirstSightingApprovalAndPairingNotice(t *testing.T) {
 	text := call.Args[len(call.Args)-1]
 	for _, want := range []string{
 		"https://raw.githubusercontent.com/mvanhorn/agentcookie/v1.4.0/scripts/teammate-install.sh",
-		"| bash -s -- v1.4.0 ab12" + strings.Repeat("0", 60),
+		"| bash -s -- v1.4.0 amd64=ab12" + strings.Repeat("0", 60) + " arm64=cd34" + strings.Repeat("0", 60),
 		"join --from mac-laptop.tail2b6977.ts.net --code ",
 		"--as grokbot --cadence turn+timer",
 		teammateStandingLine(),
@@ -182,7 +192,8 @@ func TestLifecycleFirstSightingApprovalAndPairingNotice(t *testing.T) {
 		t.Fatalf("standing line = %q", teammateStandingLine())
 	}
 	snap := h.hub.store.Snapshot()
-	if snap.LaptopDNSName != "mac-laptop.tail2b6977.ts.net" || snap.ReleasePin == nil || snap.ReleasePin.Tag != "v1.4.0" {
+	if snap.LaptopDNSName != "mac-laptop.tail2b6977.ts.net" || snap.ReleasePin == nil || snap.ReleasePin.Tag != "v1.4.0" ||
+		snap.ReleasePin.SHA256 != "ab12"+strings.Repeat("0", 60) || snap.ReleasePin.SHA256ARM64 != "cd34"+strings.Repeat("0", 60) {
 		t.Fatalf("laptop name and release pin not kept: %+v", snap)
 	}
 	if !snap.Tincan.NodeFieldsVisible || snap.Tincan.Path != h.fake.Path {
@@ -532,5 +543,165 @@ func TestLifecycleLaptopNameUsesStoredName(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("Tailscale calls with a stored name = %d, want 1", calls)
+	}
+}
+
+// A release with no linux_arm64 asset pins amd64 only; the install line
+// then carries no arm64 digest, so the installer refuses an arm64 host.
+func TestLifecyclePinsAMD64OnlyWhenARM64AssetMissing(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	h.noARM64 = true
+	h.approved()
+	asks := h.asks()
+	if len(asks) != 1 {
+		t.Fatalf("asks = %d", len(asks))
+	}
+	text := asks[0].Args[len(asks[0].Args)-1]
+	if !strings.Contains(text, "| bash -s -- v1.4.0 amd64=ab12"+strings.Repeat("0", 60)+"\n") || strings.Contains(text, "arm64=") {
+		t.Fatalf("install line should pin amd64 only:\n%s", text)
+	}
+	if pin := h.hub.store.Snapshot().ReleasePin; pin == nil || pin.SHA256ARM64 != "" || pin.SHA256 == "" {
+		t.Fatalf("pin = %+v", pin)
+	}
+}
+
+func (h *lcHarness) saveKey(peer string) {
+	h.t.Helper()
+	if err := keystore.Save(h.dir, &keystore.PeerKey{Peer: peer, Key: bytes.Repeat([]byte{1}, 32), PairedAt: stepT0}); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+func (h *lcHarness) hasKey(peer string) bool {
+	_, err := keystore.Load(h.dir, peer)
+	return err == nil
+}
+
+// A dropped paired event self-heals on the next sync.
+func TestLifecycleDroppedPairedEventSelfHeals(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	h.approved()
+	h.now = h.now.Add(time.Minute)
+	if err := h.hub.store.Update(func(st *state.TeammatesState) error {
+		st.Teammate("grokbot").PairedAt = h.now
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.hub.CancelPairing("grokbot")
+	h.lc.syncAll(context.Background())
+	if rec := h.rec("grokbot"); rec.Phase != state.PhasePaired || rec.NotifyID != "" {
+		t.Fatalf("rec = %+v, want paired after a dropped paired event", rec)
+	}
+}
+
+// A new machine for a teammate drops the old machine's key with the old
+// binding; keys of non-teammate peers are never touched.
+func TestLifecycleNodeChangeDeletesOldKey(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	h.approved()
+	h.pairedNow()
+	h.saveKey("grokbot")
+	h.saveKey("muse-box")
+	h.answer = false
+	h.setRoster(grokEntry("nNEW", "grok-bot-2", time.Time{}))
+	h.lc.syncAll(context.Background())
+	h.answerDialog()
+	if h.hasKey("grokbot") {
+		t.Fatal("the old machine's key survived the node change")
+	}
+	if !h.hasKey("muse-box") {
+		t.Fatal("a non-teammate peer's key was deleted")
+	}
+	// A quiet poll on the same new node deletes nothing else.
+	h.saveKey("grokbot")
+	h.lc.syncAll(context.Background())
+	if !h.hasKey("grokbot") {
+		t.Fatal("a key written after the node change was deleted without a further change")
+	}
+}
+
+// A /pair that completes after the teammate's removal was processed
+// leaves a stale key; the next sync deletes it. Non-teammate keys stay.
+func TestLifecycleSyncDeletesStaleKeyOfRemovedTeammate(t *testing.T) {
+	h := newLCHarness(t, "grokbot", "instinct")
+	h.approved()
+	h.writeList("instinct")
+	if err := h.hub.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	h.lc.syncAll(context.Background())
+	if rec := h.rec("grokbot"); rec.Phase != state.PhaseRemoved {
+		t.Fatalf("phase = %q", rec.Phase)
+	}
+	h.saveKey("grokbot") // the mid-handshake /pair lands now
+	h.saveKey("muse-box")
+	h.lc.syncAll(context.Background())
+	if h.hasKey("grokbot") {
+		t.Fatal("a removed teammate's stale key survived a sync")
+	}
+	if !h.hasKey("muse-box") {
+		t.Fatal("a non-teammate peer's key was deleted")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for a dialog goroutine to write while
+// the test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// No approval dialog (no GUI session, osascript failure): the owner gets
+// a plain notice and a log line, both naming the approve command.
+func TestLifecycleDialogErrorPostsApproveCommand(t *testing.T) {
+	h := newLCHarness(t, "grokbot")
+	logBuf := &syncBuffer{}
+	h.lc.log = logBuf
+	approvalDialogFunc = func(context.Context, notify.ApprovalRequest) (bool, error) {
+		return false, errors.New("no GUI session")
+	}
+	type notice struct{ title, body string }
+	notices := make(chan notice, 1)
+	ownerNoticeFunc = func(_ context.Context, title, body string) error {
+		notices <- notice{title, body}
+		return nil
+	}
+	h.setRoster(grokEntry("nGROK", "grok-bot", time.Time{}))
+	h.lc.syncAll(context.Background())
+
+	want := notify.ApproveCommand("grokbot", "nGROK")
+	select {
+	case n := <-notices:
+		if !strings.Contains(n.body, want) || !strings.Contains(n.title, "grokbot") {
+			t.Fatalf("notice = %+v, want it to name %q", n, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no fallback notice after the dialog failed")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logBuf.String(), "no approval dialog (no GUI session)") {
+		if time.Now().After(deadline) {
+			t.Fatalf("fallback log missing:\n%s", logBuf.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(logBuf.String(), "approve from a terminal: "+want) {
+		t.Fatalf("fallback log does not name the approve command:\n%s", logBuf.String())
+	}
+	if rec := h.rec("grokbot"); rec.BoundNodeID != "" || rec.Phase != state.PhaseAwaitingApproval {
+		t.Fatalf("a failed dialog must bind nothing: %+v", rec)
 	}
 }

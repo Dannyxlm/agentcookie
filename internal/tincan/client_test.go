@@ -177,3 +177,22 @@ func writeExe(t *testing.T, p string) {
 		t.Fatal(err)
 	}
 }
+
+// A tincan that leaves a child holding its stdout open must not hang the
+// caller past its timeout: WaitDelay bounds the wait after the kill.
+func TestRunReturnsWhenChildHoldsStdout(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "tincan")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 15 &\nsleep 15\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{Path: script, Config: "/cfg/agentcookie.json", Timeout: 100 * time.Millisecond}
+	start := time.Now()
+	_, err := c.Roster(context.Background())
+	if err == nil {
+		t.Fatal("a timed-out tincan must be an error")
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("Roster returned after %s; a child holding stdout must not block past WaitDelay", d)
+	}
+}

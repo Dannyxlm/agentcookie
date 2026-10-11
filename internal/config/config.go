@@ -81,11 +81,14 @@ type SinkConfig struct {
 // PullRef configures pull mode. From is the laptop's pinned MagicDNS name
 // (host or host:port; the port defaults to 9998). Cadence is turn or
 // turn+timer. Proxy, when set, carries every pull and pairing request and
-// wins over HTTP_PROXY/HTTPS_PROXY.
+// wins over HTTP_PROXY/HTTPS_PROXY. As is this agent's Tincan name (join's
+// --as); pulls name it in X-Agentcookie-Teammate so a laptop serving two
+// agents on one machine knows whose key was lost.
 type PullRef struct {
 	From    string  `yaml:"from" json:"from"`
 	Cadence Cadence `yaml:"cadence,omitempty" json:"cadence,omitempty"`
 	Proxy   string  `yaml:"proxy,omitempty" json:"proxy,omitempty"`
+	As      string  `yaml:"as,omitempty" json:"as,omitempty"`
 }
 
 // PullMode reports whether sink.yaml configures pull mode.
