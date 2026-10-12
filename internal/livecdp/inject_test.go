@@ -73,6 +73,10 @@ func TestBuildCookieParams_DomainCookie(t *testing.T) {
 // the real session cookies.
 func TestBuildCookieParams_HTTPOnlyPersistent(t *testing.T) {
 	c := chrome.Cookie{HostKey: "github.com", Name: "user_session", Value: "v", Path: "/", IsSecure: 1, IsHTTPOnly: 1, ExpiresUTC: 13363527432123456}
+	// That expiry is mid-2024; pin the clock before it so the cookie is live.
+	old := injectNow
+	injectNow = func() time.Time { return time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC) }
+	t.Cleanup(func() { injectNow = old })
 	p := BuildCookieParams([]chrome.Cookie{c})[0]
 	if !p.HTTPOnly {
 		t.Errorf("HTTPOnly must be preserved")

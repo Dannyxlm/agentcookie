@@ -470,7 +470,18 @@ func applySealedEnvelope(
 		if liveCDPErr != nil {
 			fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection failed (sidecar write succeeded): %v\n", liveCDPErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies into %d context(s) at %s\n", len(cookies), liveCDPContexts, liveCDPEndpoint)
+			// The count Chrome actually received: expired cookies are
+			// skipped and the batch is capped (see livecdp.BuildCookieParams).
+			pushed := len(livecdp.BuildCookieParams(cookies))
+			if pushed < len(cookies) {
+				which := "most recently used"
+				if !livecdp.HasAccessTimes(cookies) {
+					which = "last, with no access times to rank by"
+				}
+				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d of %d cookies (expired skipped; the %s kept under Chrome's ~%d cap) into %d context(s) at %s; all stay in the sidecar store\n", pushed, len(cookies), which, livecdp.MaxInjectCookies, liveCDPContexts, liveCDPEndpoint)
+			} else {
+				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies into %d context(s) at %s\n", pushed, liveCDPContexts, liveCDPEndpoint)
+			}
 		}
 	}
 
