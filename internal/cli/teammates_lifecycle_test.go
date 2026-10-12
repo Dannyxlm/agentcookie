@@ -250,6 +250,37 @@ func (h *lcHarness) pairedNow() {
 	h.lc.handleHubEvent(context.Background(), TeammateEvent{Kind: TeammatePaired, Name: "grokbot", NodeID: "nGROK"})
 }
 
+// A pairing notice the teammate already answered cannot be withdrawn: the
+// relay answers 409. That is not an error, so nothing is logged and the
+// record carries no open notice. Any other cancel failure is still logged.
+func TestLifecyclePairedNoticeAlreadyAnswered(t *testing.T) {
+	cases := []struct {
+		name    string
+		stderr  string
+		wantLog bool
+	}{
+		{"answered", "tincan: relay: request is not in a state that allows this (HTTP 409)\n", false},
+		{"relay down", "tincan: dial tcp: connection refused\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newLCHarness(t, "grokbot")
+			h.approved()
+			h.fake.Set("cancel", "", tc.stderr, 1)
+			h.pairedNow()
+			if rec := h.rec("grokbot"); rec.Phase != state.PhasePaired || rec.NotifyID != "" {
+				t.Fatalf("rec = %+v", rec)
+			}
+			if c := h.fake.CallsTo("cancel"); len(c) != 1 || c[0].Args[1] != "r-1" {
+				t.Fatalf("cancel calls = %+v", c)
+			}
+			if got := strings.Contains(h.log.String(), "could not withdraw notice"); got != tc.wantLog {
+				t.Fatalf("withdraw error logged = %v, want %v; log:\n%s", got, tc.wantLog, h.log.String())
+			}
+		})
+	}
+}
+
 // Paired closes the pairing notify; a key-lost event re-pairs with no
 // dialog, and a second inside 6 hours does not.
 func TestLifecyclePairedThenKeyLost(t *testing.T) {

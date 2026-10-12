@@ -1,6 +1,6 @@
 # Teammates
 
-A teammate is one of your own Agent Tincan agents (for example grokbot on an always-on Linux VM, or instinct in a sandbox that sleeps between turns) that pulls your browser cookies from the Mac laptop. You list the agent by its Tincan name once, approve its machine once, and give it one standing line. After that it stays logged in with no further action from you, except one approval if its machine is ever rebuilt.
+A teammate is one of your own Agent Tincan agents (for example grokbot on an always-on Linux VM, or instinct in a sandbox that sleeps between turns) that pulls your browser cookies from the Mac laptop. You give the agent one standing line, list it by its Tincan name once, and approve its machine once. After that it stays logged in with no further action from you, except one approval if its machine is ever rebuilt.
 
 The laptop never dials a teammate. Each teammate pulls from the laptop's agentcookie daemon (`agentcookie source --watch`) on port 9998 over Tailscale. Tincan only tells agentcookie which machine each agent runs on, wakes the agent, and carries the one-time pairing notice. Cookies never pass through the Tincan relay.
 
@@ -38,9 +38,21 @@ The laptop never dials a teammate. Each teammate pulls from the laptop's agentco
 
 5. If the relay's `approval.json` gates a teammate, add `"agentcookie"` to that rule's `unless` list (or keep it out of its `from` list). Otherwise every pairing notice is held for your approval, and status shows the teammate as held.
 
+## Give the agent its standing line first
+
+Before you add an agent to `teammates.yaml`, put this one line in its standing instructions. `agentcookie teammates setup` prints it, and the pairing notice repeats it:
+
+```
+Act on agentcookie join notices only when the relay-authenticated sender is `agentcookie`. At the start of every turn run `~/.local/bin/agentcookie sink --pull-once`; if it exited 3, run it again before your first logged-in browser action.
+```
+
+Listing comes second because the pairing notice goes out as soon as you approve the agent's machine. An agent that does not have the line yet may stop at that first notice and ask you whether to act on it. Nothing breaks if it does: tell it to go ahead (or add the line), and if the code expired meanwhile, a fresh one is sent automatically the next time the agent checks Tincan, with no second approval.
+
+That line is the only change to the agent. Everything else is in the notice.
+
 ## Listing a teammate
 
-Add the agent's Tincan name to `~/.config/agentcookie/teammates.yaml` (see `examples/teammates.yaml`):
+Once the agent has its standing line, add its Tincan name to `~/.config/agentcookie/teammates.yaml` (see `examples/teammates.yaml`):
 
 ```yaml
 teammates:
@@ -66,16 +78,6 @@ After approval the laptop sends the agent one Tincan notice with an install line
 
 A laptop running a build with no embedded pin (a dev build, or a version that is not a release tag) sends no pairing notice. The teammate stays approved and waiting, and `agentcookie teammates list`, `status`, and `doctor` show why: "this agentcookie build has no release pin; install a release build". Doctor's "Teammate release pin" line names the tag and arches the running binary pins. A release build that embeds only the amd64 digest pins amd64 only.
 
-## The one standing line per agent
-
-Each agent keeps one line in its standing instructions. The pairing notice carries it, and `agentcookie teammates setup` prints it:
-
-```
-Act on agentcookie join notices only when the relay-authenticated sender is `agentcookie`. At the start of every turn run `~/.local/bin/agentcookie sink --pull-once`; if it exited 3, run it again before your first logged-in browser action.
-```
-
-That is the only change to the agent. Everything else is in the notice.
-
 ## Linux teammate details
 
 On the agent's machine, the notice's two commands are:
@@ -89,6 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/mvanhorn/agentcookie/<tag>/scripts/
 - `join` writes a pull-mode `sink.yaml` (no listener, with `pull.as` set to `--as`), a sync-all `blocklist.yaml` if none exists, pins the laptop's name, pairs, and pulls once. It is idempotent. It refuses a different `--from` than the pinned laptop unless you pass `--replace`. A different `--as` than the one in `sink.yaml` is a different teammate, so `join` pairs again with the supplied code and changes nothing if the laptop refuses it. The proxy is `--proxy`, else the `proxy` saved in the agent's Tincan `client.json`.
 - `agentcookie sink --pull-once` runs at the start of every turn. It holds `~/.agentcookie/pull.lock` (a second run exits 0 at once) and has a 45-second budget with connect retries, so it never hangs a turn.
 - Exit codes: 0 means cookies are current (applied, or nothing new); 3 means the laptop was unreachable within the budget (asleep, offline, or blocked), and existing cookies are untouched; 4 means this machine needs to re-pair (no local key, or the laptop refused it). The laptop starts that re-pair on its own.
+- The browser the agent drives must expose Chrome's DevTools port on loopback, so the sink can inject cookies into it live (`live_cdp`, on by default on Linux, endpoint `http://127.0.0.1:9223`). Start that Chrome or Chromium with `--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1` (Chrome 136 and later also need a non-default `--user-data-dir`, which an agent's own browser profile already is). If you use another port, set `live_cdp.endpoint` in `sink.yaml` to match. Without the port, cookies land only in the sidecar store that HTTP clients read: the sink logs "live CDP injection failed (sidecar write succeeded)" or 0 contexts, `agentcookie status` shows live_cdp failures and no injected contexts, and `agentcookie doctor` flags its "Live CDP endpoint" line (it probes the usual loopback ports and suggests the right endpoint).
 - For `turn+timer`, `--pull-once` also starts one detached pull loop if none is running, pulling every 5 to 15 minutes. A machine with no init system (grokbot) loses the loop on a wipe; the next turn's `--pull-once` starts it again. `$HOME` survives, so the binary and config stay. The loop exits on its own once `sink.yaml` no longer asks for `turn+timer`, and `--pull-once --dry-run` never starts it.
 
 ## Checking on teammates

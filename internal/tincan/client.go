@@ -265,9 +265,20 @@ func (c *Client) Notify(ctx context.Context, to, text string) SendResult {
 	return SendResult{Outcome: OutcomeSent, RequestID: s.Request.ID}
 }
 
+// ErrNotCancellable means the relay refused to withdraw a request because
+// it is no longer open (the recipient already answered it, or it closed):
+// the relay answers HTTP 409. Nothing is left to withdraw.
+var ErrNotCancellable = errors.New("request is no longer open")
+
 // Cancel withdraws a request the agent sent, with `tincan cancel <id>`.
+// A request that is no longer open returns an error wrapping
+// ErrNotCancellable; any other failure is returned as is.
 func (c *Client) Cancel(ctx context.Context, id string) error {
 	_, err := c.run(ctx, "cancel", id)
+	var re *runError
+	if err != nil && errors.As(err, &re) && strings.Contains(re.stderr, "(HTTP 409)") {
+		return fmt.Errorf("%w: %w", ErrNotCancellable, err)
+	}
 	return err
 }
 

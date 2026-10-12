@@ -121,6 +121,35 @@ func TestCancelAndRequestStatus(t *testing.T) {
 	}
 }
 
+// A notice the teammate already answered (or that closed) cannot be
+// withdrawn; the relay answers 409 and Cancel reports ErrNotCancellable.
+// Any other failure stays a plain error.
+func TestCancelClassifiesNotCancellable(t *testing.T) {
+	cases := []struct {
+		name           string
+		stderr         string
+		notCancellable bool
+	}{
+		{"already answered", "tincan: relay: request is not in a state that allows this (HTTP 409)\n", true},
+		{"relay down", "tincan: dial tcp: connection refused\n", false},
+		{"forbidden", "tincan: relay: not your request (HTTP 403)\n", false},
+		{"rate limited", "tincan: relay: too many requests (HTTP 429)\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, f := newTestClient(t)
+			f.Set("cancel", "", tc.stderr, 1)
+			err := c.Cancel(context.Background(), "r-9")
+			if err == nil {
+				t.Fatal("a failed cancel returns an error")
+			}
+			if got := errors.Is(err, ErrNotCancellable); got != tc.notCancellable {
+				t.Fatalf("errors.Is(ErrNotCancellable) = %v, want %v (err %v)", got, tc.notCancellable, err)
+			}
+		})
+	}
+}
+
 func TestDrainInboxConsumes(t *testing.T) {
 	c, f := newTestClient(t)
 	f.Set("inbox", `{"requests":[{"id":"q1","to":"agentcookie","body":"hi"}],"replies":[]}`, "", 0)

@@ -211,8 +211,9 @@ func (l *teammateLifecycle) execute(ctx context.Context, name string, a tmAction
 		if err == nil {
 			err = c.Cancel(ctx, a.RequestID)
 		}
-		if err != nil {
-			// A notify the teammate already took cannot be withdrawn.
+		// A notice the teammate already answered, or that closed, needs no
+		// withdrawal; the step already cleared it from the record.
+		if err != nil && !errors.Is(err, tincan.ErrNotCancellable) {
 			l.logf("teammate %s: could not withdraw notice %s: %v", name, a.RequestID, err)
 		}
 	case actCancelPairing:
