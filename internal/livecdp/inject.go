@@ -76,7 +76,13 @@ func BuildCookieParams(cookies []chrome.Cookie) []*network.CookieParam {
 		return cmp.Compare(a.LastAccessUTC, b.LastAccessUTC)
 	})
 	params := make([]*network.CookieParam, 0, len(ordered))
+	now := injectNow()
 	for _, c := range ordered {
+		// Chrome cannot keep an expired cookie, so it must not take a
+		// usable cookie's slot under the cap.
+		if exp := expiresEpoch(c.ExpiresUTC); exp != nil && !exp.Time().After(now) {
+			continue
+		}
 		if p := buildParam(c); p != nil {
 			params = append(params, p)
 		}
@@ -85,6 +91,16 @@ func BuildCookieParams(cookies []chrome.Cookie) []*network.CookieParam {
 		params = params[len(params)-MaxInjectCookies:]
 	}
 	return params
+}
+
+// injectNow is the clock BuildCookieParams checks expiry against.
+var injectNow = time.Now
+
+// HasAccessTimes reports whether any cookie carries a last-access time, so
+// the cap keeps the most recently used cookies. Without one (the CDP
+// source), the cap keeps the last MaxInjectCookies in input order.
+func HasAccessTimes(cookies []chrome.Cookie) bool {
+	return slices.ContainsFunc(cookies, func(c chrome.Cookie) bool { return c.LastAccessUTC != 0 })
 }
 
 // MaxInjectCookies is the most cookies one injection pushes. Chrome's

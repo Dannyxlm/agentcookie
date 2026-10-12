@@ -161,3 +161,34 @@ func freePort(t *testing.T) int {
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
 }
+
+// Expired cookies never take a live cookie's slot under the cap: Chrome
+// cannot keep an expired cookie, so counting it would push out a usable
+// session for nothing.
+func TestBuildCookieParams_ExpiredCookiesDoNotTakeSlots(t *testing.T) {
+	past := (time.Now().Add(-time.Hour).Unix() + 11644473600) * 1e6
+	expired := bulkCookies(MaxInjectCookies, 3_000_000)
+	for i := range expired {
+		expired[i].ExpiresUTC = past
+		expired[i].HasExpires = 1
+	}
+	batch := append(githubSessionCookies(1_000_000), expired...)
+	params := BuildCookieParams(batch)
+	if len(params) != len(githubSessionCookies(0)) {
+		t.Fatalf("got %d params, want only the %d unexpired session cookies", len(params), len(githubSessionCookies(0)))
+	}
+	for _, p := range params {
+		if p.Name == "c" {
+			t.Fatalf("unexpected cookie %q kept", p.Name)
+		}
+	}
+}
+
+func TestHasAccessTimes(t *testing.T) {
+	if HasAccessTimes(bulkCookies(3, 0)) {
+		t.Fatal("cookies without last access times reported as having them")
+	}
+	if !HasAccessTimes(githubSessionCookies(5)) {
+		t.Fatal("cookies with last access times reported as lacking them")
+	}
+}
