@@ -164,7 +164,7 @@ Replace:
 
 ### Teammates: your Tincan agents pull from the laptop
 
-List your own Agent Tincan agents by name in `~/.config/agentcookie/teammates.yaml` on the laptop, approve each agent's machine once in a dialog, and give each agent one standing line. The agent then pulls fresh cookies at the start of every turn (and every 5 to 15 minutes if it is always on) over Tailscale, never through the Tincan relay. Only the Tailscale node you approved can pair or pull. Start with `agentcookie teammates setup`; `agentcookie doctor` shows each teammate's state and names a missing tailnet ACL rule. The full guide is [docs/teammates.md](docs/teammates.md).
+Give each of your own Agent Tincan agents one standing line first, then list it by name in `~/.config/agentcookie/teammates.yaml` on the laptop and approve its machine once in a dialog. (An agent that gets its pairing notice before it has the line may stop to ask you; a fresh code is sent automatically the next time it checks Tincan.) The agent then pulls fresh cookies at the start of every turn (and every 5 to 15 minutes if it is always on) over Tailscale, never through the Tincan relay. Only the Tailscale node you approved can pair or pull. Start with `agentcookie teammates setup`; `agentcookie doctor` shows each teammate's state and names a missing tailnet ACL rule. The full guide is [docs/teammates.md](docs/teammates.md).
 
 ### Linux teammate agents (pull from the laptop)
 
@@ -181,7 +181,7 @@ bash teammate-install.sh v1.2.3 amd64=<sha256> arm64=<sha256>
 ~/.local/bin/agentcookie sink --pull-once
 ```
 
-`join` writes a pull-mode `sink.yaml` (no `listen.addr`), a sync-all `blocklist.yaml` if none exists, pairs, and pulls once. The proxy comes from `--proxy` or the `proxy` saved in the agent's Tincan `client.json`. `--pull-once` exits 0 when cookies are current, 3 when the laptop is unreachable (retry before the first logged-in action), and 4 when the machine needs to re-pair. With `--cadence turn+timer` it also keeps one background loop pulling every 5 to 15 minutes. The tailnet ACL must let the agent's tag reach `<laptop>:9998`.
+`join` writes a pull-mode `sink.yaml` (no `listen.addr`), a sync-all `blocklist.yaml` if none exists, pairs, and pulls once. The proxy comes from `--proxy` or the `proxy` saved in the agent's Tincan `client.json`. `--pull-once` exits 0 when cookies are current, 3 when the laptop is unreachable (retry before the first logged-in action), and 4 when the machine needs to re-pair. With `--cadence turn+timer` it also keeps one background loop pulling every 5 to 15 minutes. The tailnet ACL must let the agent's tag reach `<laptop>:9998`. For live injection into the browser the agent drives, start that browser with `--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1` (the default `live_cdp.endpoint` is `http://127.0.0.1:9223`); without it cookies land only in the sidecar store for HTTP clients and the sink reports 0 contexts.
 
 ### Linux CDP source (existing browser; no SQLite access)
 

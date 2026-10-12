@@ -169,7 +169,7 @@ func TestTeammatesSetupRecordsPathAndChecksAdminView(t *testing.T) {
 	if cfg.TincanPath != fake.Path {
 		t.Fatalf("tincan_path = %q, want %q", cfg.TincanPath, fake.Path)
 	}
-	for _, want := range []string{"tincan: " + fake.Path, "roster: OK", `"dst": ["mac-laptop.tail.ts.net:9998"]`, "Teammates: grokbot", `"unless"`, "already joined"} {
+	for _, want := range []string{"tincan: " + fake.Path, "roster: OK", `"dst": ["mac-laptop.tail.ts.net:9998"]`, "Teammates: grokbot", `"unless"`, "already joined", "5. Before you add an agent to teammates.yaml, give it its standing line", teammateStandingLine()} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("setup output lacks %q:\n%s", want, out.String())
 		}

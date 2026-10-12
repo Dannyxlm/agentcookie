@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Teammates: quiet withdrawal of an answered notice; standing line first
+
+- After a teammate pairs, the laptop withdraws its pairing notice. When the teammate had already answered it, the relay refuses the withdrawal with HTTP 409 and the daemon logged "could not withdraw notice ...: exit status 1". The tincan client now reports that refusal as `tincan.ErrNotCancellable`, and the lifecycle treats it as done (the notice is already cleared from the teammate's record) with no log line. Any other cancel failure is still logged.
+- Docs: give each agent its standing line before adding it to `teammates.yaml`. An agent without the line may stop at its first pairing notice to ask the owner; a fresh code is sent automatically the next time it checks Tincan. `docs/teammates.md`, the README, and the steps `agentcookie teammates setup` prints now list the standing line first.
+- Docs: a Linux teammate's browser must run with `--remote-debugging-port=9223 --remote-debugging-address=127.0.0.1` (the default `live_cdp.endpoint`) for live cookie injection. Without it cookies reach only the sidecar store for HTTP clients and the sink reports 0 contexts.
+
 ### Tailscale CLI works under launchd on the Mac app
 
 - Every `tailscale` call (status, whois) now sets `TAILSCALE_BE_CLI=1`. The Tailscale.app binary acts as a CLI only when it sees a terminal, so under launchd it tried to start its GUI and failed. That left the teammate pairing notice waiting on "MagicDNS name unknown", refused teammate pulls because whois failed (fail closed), and made the push offline check fall back to dialing.

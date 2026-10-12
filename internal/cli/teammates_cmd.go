@@ -457,7 +457,8 @@ func runTeammatesSetup(ctx context.Context, out io.Writer, configDir, home strin
 		fmt.Fprintf(out, "     Teammates: %s\n", strings.Join(names, ", "))
 	}
 	fmt.Fprintln(out, "  4. Tincan approval gate: if approval.json on the relay host gates a teammate, add \"agentcookie\" to its \"unless\" list (or keep it out of its \"from\" list), so pairing notices are not held.")
-	fmt.Fprintln(out, "Then give each teammate its standing line (also sent in its pairing notice):")
-	fmt.Fprintf(out, "  %s\n", teammateStandingLine())
+	fmt.Fprintln(out, "  5. Before you add an agent to teammates.yaml, give it its standing line (its pairing notice repeats it). An agent without the line may stop at its first pairing notice to ask you; a fresh code is sent automatically the next time it checks Tincan:")
+	fmt.Fprintf(out, "     %s\n", teammateStandingLine())
+	fmt.Fprintln(out, "  6. Then add the agent's name to teammates.yaml and approve its machine when the dialog appears.")
 	return nil
 }
