@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Live browser injection keeps your logins
+
+- Chrome holds at most about 3300 cookies and evicts the least recently used past that, counting an injected cookie as used when it is set. A large batch (4868 cookies in the live test) silently evicted the first ~1800 it set, which included GitHub's session, so the agent's real browser stayed logged out while the push reported success. Live CDP injection now pushes only the 3000 most recently used cookies, oldest first, so the ones you use are kept. The sink log says how many were pushed and how many stayed sidecar-only.
+
 ### Teammates: quiet withdrawal of an answered notice; standing line first
 
 - After a teammate pairs, the laptop withdraws its pairing notice. When the teammate had already answered it, the relay refuses the withdrawal with HTTP 409 and the daemon logged "could not withdraw notice ...: exit status 1". The tincan client now reports that refusal as `tincan.ErrNotCancellable`, and the lifecycle treats it as done (the notice is already cleared from the teammate's record) with no log line. Any other cancel failure is still logged.

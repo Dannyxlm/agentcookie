@@ -20,8 +20,10 @@
 package livecdp
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -65,15 +67,38 @@ func Inject(ctx context.Context, cookies []chrome.Cookie) error {
 // real Set-Cookie navigation would. The dot is load-bearing: CDP
 // Network.setCookie stores a dot-less Domain host-only, which narrows a
 // parent-domain cookie to its apex and breaks delivery to app subdomains.
+//
+// The batch is ordered least-recently-used first and trimmed to
+// MaxInjectCookies; see MaxInjectCookies for why both are load-bearing.
 func BuildCookieParams(cookies []chrome.Cookie) []*network.CookieParam {
-	params := make([]*network.CookieParam, 0, len(cookies))
-	for _, c := range cookies {
+	ordered := slices.Clone(cookies)
+	slices.SortStableFunc(ordered, func(a, b chrome.Cookie) int {
+		return cmp.Compare(a.LastAccessUTC, b.LastAccessUTC)
+	})
+	params := make([]*network.CookieParam, 0, len(ordered))
+	for _, c := range ordered {
 		if p := buildParam(c); p != nil {
 			params = append(params, p)
 		}
 	}
+	if len(params) > MaxInjectCookies {
+		params = params[len(params)-MaxInjectCookies:]
+	}
 	return params
 }
+
+// MaxInjectCookies is the most cookies one injection pushes. Chrome's
+// cookie store (net::CookieMonster) holds at most 3300 cookies; past that it
+// garbage-collects down to 3000 by evicting the least-recently-accessed
+// ones. Injected cookies get last-access = time set, so in an oversized
+// Storage.setCookies batch the FIRST cookies set are evicted by the later
+// ones, and the call still reports success. Verified 2026-10-11 against
+// headless Chrome 154: a 4868-cookie batch left 3062 cookies, and GitHub's
+// session cookies, sitting early in the batch, were gone (the browser then
+// redirected github.com/settings to /login). Pushing at most 3000, ordered
+// least-recently-used first (source last_access_utc), keeps the cookies the
+// user actually uses and lets Chrome evict its own stale cookies instead.
+const MaxInjectCookies = 3000
 
 func buildParam(c chrome.Cookie) *network.CookieParam {
 	if c.Name == "" || c.HostKey == "" {

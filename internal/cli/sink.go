@@ -470,7 +470,12 @@ func applySealedEnvelope(
 		if liveCDPErr != nil {
 			fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection failed (sidecar write succeeded): %v\n", liveCDPErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies into %d context(s) at %s\n", len(cookies), liveCDPContexts, liveCDPEndpoint)
+			pushed := min(len(cookies), livecdp.MaxInjectCookies)
+			if dropped := len(cookies) - pushed; dropped > 0 {
+				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed the %d most recently used of %d cookies into %d context(s) at %s (Chrome holds about %d; the %d least recently used stay in the sidecar store only)\n", pushed, len(cookies), liveCDPContexts, liveCDPEndpoint, livecdp.MaxInjectCookies, dropped)
+			} else {
+				fmt.Fprintf(os.Stderr, "agentcookie sink: live CDP injection pushed %d cookies into %d context(s) at %s\n", pushed, liveCDPContexts, liveCDPEndpoint)
+			}
 		}
 	}
 
