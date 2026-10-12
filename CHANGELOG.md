@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Tailscale CLI works under launchd on the Mac app
+
+- Every `tailscale` call (status, whois) now sets `TAILSCALE_BE_CLI=1`. The Tailscale.app binary acts as a CLI only when it sees a terminal, so under launchd it tried to start its GUI and failed. That left the teammate pairing notice waiting on "MagicDNS name unknown", refused teammate pulls because whois failed (fail closed), and made the push offline check fall back to dialing.
+
 ### Teammates: listed agents pull cookies from the laptop (groundwork)
 
 - New owner file `~/.config/agentcookie/teammates.yaml` lists Tincan agent names (with an optional `cadence` of `turn` or `turn+timer`, plus optional `tincan_path` and `tincan_config`). Decoding is strict: unknown keys, duplicate names, and virtual Tincan agents (chatgpt, sesame, and `*-web` agents, which never have a Tailscale node) are rejected with a message saying why. See `examples/teammates.yaml`.

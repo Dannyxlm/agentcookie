@@ -63,6 +63,16 @@ func FindCLI() (string, error) {
 	return "", ErrNotInstalled
 }
 
+// cliCommand runs the Tailscale CLI in CLI mode. The macOS app's bundled
+// binary decides between CLI and GUI by looking for a terminal (TERM,
+// SHLVL); under launchd there is none, so without TAILSCALE_BE_CLI=1 it
+// tries to start the GUI and fails ("Tailscale.CLIError error 3").
+func cliCommand(ctx context.Context, cli string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, cli, args...)
+	cmd.Env = append(os.Environ(), "TAILSCALE_BE_CLI=1")
+	return cmd
+}
+
 // Get runs `tailscale status --json` and parses the result. Caller must
 // pass a non-empty cliPath (use FindCLI).
 func Get(ctx context.Context, cliPath string) (*Status, error) {
@@ -71,7 +81,7 @@ func Get(ctx context.Context, cliPath string) (*Status, error) {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(runCtx, cliPath, "status", "--json").Output()
+	out, err := cliCommand(runCtx, cliPath, "status", "--json").Output()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
