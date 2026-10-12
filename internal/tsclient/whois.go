@@ -67,7 +67,7 @@ func WhoIs(ctx context.Context, ip string) (*WhoIsResult, error) {
 	}
 	runCtx, cancel := context.WithTimeout(ctx, whoisTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, cli, "whois", "--json", ip)
+	cmd := cliCommand(runCtx, cli, "whois", "--json", ip)
 	// A child that outlives a killed tailscale and holds its stdout open
 	// must not hang /pull and /pair authorization.
 	cmd.WaitDelay = 2 * time.Second
